@@ -5,6 +5,7 @@ import logging
 import requests
 import random
 import subprocess
+import time
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
@@ -22,15 +23,15 @@ from googleapiclient.discovery import build
 
 SEARCH_QUERIES = [
     "Mechanical Engineering shorts",
-    "Mechanical mechanisms",
-    "Engineering gears animation",
-    "CNC machining process",
+    "Mechanical mechanisms animation",
+    "Engineering gears satisfying",
+    "CNC machining process short",
     "Thermodynamics experiment",
-    "Fluid mechanics shorts",
+    "Fluid mechanics satisfying",
     "Robotics mechanical design",
     "manufacturing process satisfying",
     "hydraulic press machine",
-    "مهندسی مکانیک",
+    "metal lathe machining",
 ]
 
 CAPTION_TEMPLATE = (
@@ -43,30 +44,12 @@ MAX_DURATION_SECONDS = 179
 MAX_POSTS_PER_RUN    = 2
 SEARCH_LOOKBACK_DAYS = 180
 MAX_FILE_SIZE_BYTES  = 50 * 1024 * 1024  # 50MB
+DELAY_BETWEEN_VIDEOS = 2  # ثانیه
 
 
 # ─────────────────────────────────────────────
-# Utilities
+# Logger
 # ─────────────────────────────────────────────
-
-class VerboseLogger:
-    """لاگر که خطاها را نمایش می‌دهد اما debug را مخفی می‌کند."""
-    def __init__(self, context):
-        self.context = context
-
-    def debug(self, msg):
-        # فقط خطاهای مهم را نمایش بده
-        if 'ERROR' in msg.upper() or 'WARNING' in msg.upper():
-            self.context.log(f"   [ytdlp] {msg[:150]}")
-
-    def warning(self, msg):
-        self.context.log(f"   [WARN] {msg[:150]}")
-
-    def error(self, msg):
-        self.context.log(f"   [ERR] {msg[:200]}")
-
-    def info(self, msg): pass
-
 
 class QuietLogger:
     def debug(self, msg): pass
@@ -75,15 +58,19 @@ class QuietLogger:
     def info(self, msg): pass
 
 
+# ─────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────
+
 @contextmanager
 def suppress_stderr():
-    old_stderr = sys.stderr
+    old = sys.stderr
     try:
         with open(os.devnull, 'w') as devnull:
             sys.stderr = devnull
             yield
     finally:
-        sys.stderr = old_stderr
+        sys.stderr = old
 
 
 def cleanup_files(file_list: list) -> None:
@@ -91,27 +78,35 @@ def cleanup_files(file_list: list) -> None:
         try:
             if os.path.exists(f):
                 os.remove(f)
-        except OSError as e:
-            logging.warning(f"Could not remove file {f}: {e}")
+        except OSError:
+            pass
 
 
 def get_env(key: str) -> str:
-    value = os.environ.get(key)
-    if not value:
-        raise EnvironmentError(f"Missing required env var: {key}")
-    return value
+    val = os.environ.get(key)
+    if not val:
+        raise EnvironmentError(f"Missing env var: {key}")
+    return val
 
 
-def get_ytdlp_version(context) -> None:
-    """نسخه yt-dlp نصب شده را نمایش می‌دهد."""
+def get_ytdlp_version(context) -> str:
     try:
-        result = subprocess.run(
-            ['yt-dlp', '--version'],
-            capture_output=True, text=True, timeout=10
-        )
-        context.log(f"ℹ️  yt-dlp version: {result.stdout.strip()}")
+        import yt_dlp.version as v
+        version = v.__version__
+        context.log(f"ℹ️  yt-dlp version: {version}")
+        return version
     except Exception:
-        context.log("⚠️  Could not get yt-dlp version")
+        try:
+            result = subprocess.run(
+                [sys.executable, '-m', 'yt_dlp', '--version'],
+                capture_output=True, text=True, timeout=10
+            )
+            version = result.stdout.strip()
+            context.log(f"ℹ️  yt-dlp version (subprocess): {version}")
+            return version
+        except Exception as e:
+            context.log(f"⚠️  Cannot get yt-dlp version: {e}")
+            return "unknown"
 
 
 # ─────────────────────────────────────────────
@@ -142,33 +137,108 @@ def register_video(databases, db_id, col_id, video_id) -> bool:
             )
             return True
         except Exception as e:
-            logging.error(f"Appwrite write failed for {video_id}: {e}")
+            logging.error(f"Appwrite write failed: {e}")
             return False
 
 
 # ─────────────────────────────────────────────
-# yt-dlp Options — چندین استراتژی
+# yt-dlp Strategies
 # ─────────────────────────────────────────────
 
-def build_opts_strategies(cookie_path: str, context) -> list[dict]:
+def build_strategies(cookie_path: str) -> list[tuple[str, dict]]:
     """
-    چند استراتژی مختلف برای دور زدن bot detection.
-    به ترتیب از ساده به پیچیده امتحان می‌شوند.
+    استراتژی‌های مختلف برای دور زدن bot detection.
+    هر استراتژی یک نام و یک dict از opts است.
     """
     cookie_exists = os.path.exists(cookie_path) if cookie_path else False
 
-    common = {
+    base = {
         'quiet': True,
         'no_warnings': True,
+        'logger': QuietLogger(),
         'noplaylist': True,
         'skip_download': True,
     }
 
     strategies = []
 
-    # ── استراتژی ۱: Android client (کمترین محدودیت) ──
-    s1 = {
-        **common,
+    # ── استراتژی ۱: WEB با cookie ─────────────
+    # اگر cookie معتبر باشد، این بهترین گزینه است
+    if cookie_exists:
+        s = {
+            **base,
+            'cookiefile': cookie_path,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['web'],
+                }
+            },
+            'http_headers': {
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+        }
+        strategies.append(('web_with_cookie', s))
+
+    # ── استراتژی ۲: Android با cookie ──────────
+    if cookie_exists:
+        s = {
+            **base,
+            'cookiefile': cookie_path,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                    'player_skip': ['webpage'],
+                }
+            },
+            'http_headers': {
+                'User-Agent': (
+                    'com.google.android.youtube/19.09.37 '
+                    '(Linux; U; Android 12; Pixel 6) gzip'
+                ),
+            },
+        }
+        strategies.append(('android_with_cookie', s))
+
+    # ── استراتژی ۳: iOS با cookie ───────────────
+    if cookie_exists:
+        s = {
+            **base,
+            'cookiefile': cookie_path,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios'],
+                }
+            },
+            'http_headers': {
+                'User-Agent': (
+                    'com.google.ios.youtube/19.09.3 '
+                    '(iPhone16,2; U; CPU iOS 17_4 like Mac OS X)'
+                ),
+            },
+        }
+        strategies.append(('ios_with_cookie', s))
+
+    # ── استراتژی ۴: tv_embedded (نیاز به cookie ندارد) ──
+    s = {
+        **base,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['tv_embedded'],
+            }
+        },
+    }
+    if cookie_exists:
+        s['cookiefile'] = cookie_path
+    strategies.append(('tv_embedded', s))
+
+    # ── استراتژی ۵: Android بدون cookie (آخرین تلاش) ──
+    s = {
+        **base,
         'extractor_args': {
             'youtube': {
                 'player_client': ['android'],
@@ -176,97 +246,60 @@ def build_opts_strategies(cookie_path: str, context) -> list[dict]:
             }
         },
         'http_headers': {
-            'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 12) gzip',
-        },
-    }
-    if cookie_exists:
-        s1['cookiefile'] = cookie_path
-    strategies.append(('android_client', s1))
-
-    # ── استراتژی ۲: TV Embedded ──
-    s2 = {
-        **common,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv_embedded'],
-            }
-        },
-        'http_headers': {
             'User-Agent': (
-                'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) '
-                'AppleWebKit/538.1 (KHTML, like Gecko) '
-                'Version/5.0 TV Safari/538.1'
+                'com.google.android.youtube/19.09.37 '
+                '(Linux; U; Android 12) gzip'
             ),
         },
     }
-    if cookie_exists:
-        s2['cookiefile'] = cookie_path
-    strategies.append(('tv_embedded', s2))
-
-    # ── استراتژی ۳: iOS client ──
-    s3 = {
-        **common,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': (
-                'com.google.ios.youtube/19.09.3 '
-                '(iPhone16,2; U; CPU iOS 17_4 like Mac OS X)'
-            ),
-        },
-    }
-    if cookie_exists:
-        s3['cookiefile'] = cookie_path
-    strategies.append(('ios_client', s3))
-
-    # ── استراتژی ۴: mweb بدون cookie ──
-    s4 = {
-        **common,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['mweb', 'web'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Linux; Android 12; Pixel 6) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Mobile Safari/537.36'
-            ),
-            'Accept-Language': 'en-US,en;q=0.9',
-        },
-    }
-    strategies.append(('mweb_no_cookie', s4))
+    strategies.append(('android_no_cookie', s))
 
     return strategies
 
 
 # ─────────────────────────────────────────────
-# Video Info با چند استراتژی
+# Video Info
 # ─────────────────────────────────────────────
 
-def get_video_info(video_url: str, strategies: list, context) -> tuple[dict | None, dict | None]:
+def get_video_info(
+    video_url: str,
+    strategies: list,
+    context
+) -> tuple[dict | None, dict | None]:
     """
     چند استراتژی را امتحان می‌کند.
-    برمی‌گرداند: (info_dict, working_opts) یا (None, None)
+    returns: (info_dict, working_base_opts) یا (None, None)
     """
-    for strategy_name, opts in strategies:
+    for name, opts in strategies:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(video_url, download=False)
-                if info:
-                    context.log(f"   ✓ Strategy '{strategy_name}' worked")
-                    # opts را برای دانلود آماده کن (بدون skip_download)
-                    dl_opts = {k: v for k, v in opts.items() if k != 'skip_download'}
-                    return info, dl_opts
+                if info and info.get('duration'):
+                    context.log(f"   ✓ '{name}' OK — duration: {info['duration']}s")
+                    # opts پایه برای دانلود (بدون skip_download)
+                    base_for_dl = {
+                        k: v for k, v in opts.items()
+                        if k not in ('skip_download', 'logger')
+                    }
+                    return info, base_for_dl
+
         except yt_dlp.utils.DownloadError as e:
-            err = str(e)[:120]
-            context.log(f"   ✗ '{strategy_name}' failed: {err}")
+            msg = str(e)
+            # خلاصه خطا
+            if 'Sign in' in msg or 'bot' in msg.lower():
+                short = 'IP blocked / bot detected'
+            elif 'player response' in msg:
+                short = 'outdated yt-dlp (update needed)'
+            elif 'not available' in msg:
+                short = 'format not available'
+            elif 'Private video' in msg:
+                short = 'private video'
+            else:
+                short = msg[:80]
+            context.log(f"   ✗ '{name}': {short}")
+
         except Exception as e:
-            context.log(f"   ✗ '{strategy_name}' error: {type(e).__name__}: {str(e)[:80]}")
+            context.log(f"   ✗ '{name}' exception: {type(e).__name__}: {str(e)[:60]}")
 
     return None, None
 
@@ -278,23 +311,28 @@ def get_video_info(video_url: str, strategies: list, context) -> tuple[dict | No
 def download_video(
     video_url: str,
     video_id: str,
-    working_opts: dict,
+    base_opts: dict,
     context
 ) -> str | None:
+    """دانلود ویدیو با استراتژی موفق."""
 
-    format_chain = (
-        'best[ext=mp4][filesize<?50M]'
+    # فرمت: ابتدا pre-merged، سپس best
+    format_selector = (
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]'
+        '/best[ext=mp4][filesize<?50M]'
         '/best[ext=webm][filesize<?50M]'
         '/best[filesize<?50M]'
         '/best'
     )
 
     dl_opts = {
-        **working_opts,
-        'format': format_chain,
+        **base_opts,
+        'format': format_selector,
         'outtmpl': f'/tmp/{video_id}.%(ext)s',
         'overwrites': True,
         'logger': QuietLogger(),
+        'quiet': True,
+        'no_warnings': True,
     }
 
     try:
@@ -302,31 +340,67 @@ def download_video(
             ydl.download([video_url])
 
     except yt_dlp.utils.DownloadError as e:
-        err_msg = str(e)[:150]
-        if 'ffmpeg' in err_msg.lower() or 'merger' in err_msg.lower():
-            context.log(f"   🚫 FFmpeg required — skipping")
+        msg = str(e)
+        if 'ffmpeg' in msg.lower() or 'merger' in msg.lower():
+            # fallback: فرمت pre-merged بدون ادغام
+            context.log("   ↳ FFmpeg needed, trying pre-merged only...")
+            return _download_premerged(video_url, video_id, base_opts, context)
         else:
-            context.log(f"   ⚠️  DownloadError: {err_msg}")
-        cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
-        return None
+            context.log(f"   ⚠️  Download failed: {msg[:100]}")
+            cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
+            return None
 
     except Exception as e:
-        context.log(f"   ⚠️  Unexpected: {str(e)[:100]}")
+        context.log(f"   ⚠️  Unexpected: {str(e)[:80]}")
         cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
         return None
 
+    return _find_downloaded_file(video_id, context)
+
+
+def _download_premerged(
+    video_url: str,
+    video_id: str,
+    base_opts: dict,
+    context
+) -> str | None:
+    """فرمت pre-merged (بدون نیاز به FFmpeg)."""
+    dl_opts = {
+        **base_opts,
+        'format': 'best[ext=mp4][filesize<?50M]/best[filesize<?50M]/best',
+        'outtmpl': f'/tmp/{video_id}.%(ext)s',
+        'overwrites': True,
+        'logger': QuietLogger(),
+        'quiet': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            ydl.download([video_url])
+    except Exception as e:
+        context.log(f"   ⚠️  Pre-merged also failed: {str(e)[:80]}")
+        cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
+        return None
+
+    return _find_downloaded_file(video_id, context)
+
+
+def _find_downloaded_file(video_id: str, context) -> str | None:
     downloaded = glob.glob(f"/tmp/{video_id}.*")
     valid = [
         f for f in downloaded
         if not f.endswith('.part')
+        and os.path.exists(f)
+        and os.path.getsize(f) > 0
         and os.path.getsize(f) <= MAX_FILE_SIZE_BYTES
     ]
 
     if not valid:
-        context.log(f"   ⚠️  File missing or too large")
+        context.log("   ⚠️  No valid file found after download")
         cleanup_files(downloaded)
         return None
 
+    size_mb = os.path.getsize(valid[0]) / (1024 * 1024)
+    context.log(f"   📁 File: {os.path.basename(valid[0])} ({size_mb:.1f} MB)")
     return valid[0]
 
 
@@ -334,12 +408,19 @@ def download_video(
 # Telegram
 # ─────────────────────────────────────────────
 
-def send_to_telegram(token, channel, file_path, title, video_url, context) -> bool:
+def send_to_telegram(
+    token: str,
+    channel: str,
+    file_path: str,
+    title: str,
+    video_url: str,
+    context
+) -> bool:
     api_url = f"https://api.telegram.org/bot{token}/sendVideo"
     caption = CAPTION_TEMPLATE.format(title=title, url=video_url)
 
     try:
-        with open(file_path, 'rb') as video_file:
+        with open(file_path, 'rb') as vf:
             response = requests.post(
                 api_url,
                 data={
@@ -348,18 +429,21 @@ def send_to_telegram(token, channel, file_path, title, video_url, context) -> bo
                     "parse_mode": "Markdown",
                     "supports_streaming": True,
                 },
-                files={"video": video_file},
+                files={"video": vf},
                 timeout=120,
             )
 
         if response.status_code == 200:
             return True
 
-        context.log(f"⚠️  Telegram HTTP {response.status_code}: {response.text[:200]}")
+        context.log(
+            f"   ⚠️  Telegram HTTP {response.status_code}: "
+            f"{response.text[:150]}"
+        )
         return False
 
     except requests.RequestException as e:
-        context.log(f"⚠️  Telegram error: {e}")
+        context.log(f"   ⚠️  Telegram error: {e}")
         return False
 
 
@@ -368,141 +452,133 @@ def send_to_telegram(token, channel, file_path, title, video_url, context) -> bo
 # ─────────────────────────────────────────────
 
 def main(context):
-    context.log("⏰ Bot execution started...")
+    context.log("⏰ Bot started")
 
-    # ── env vars ──────────────────────────────
+    # ── env ──────────────────────────────────
     try:
         endpoint        = get_env("APPWRITE_ENDPOINT")
         project_id      = get_env("APPWRITE_PROJECT_ID")
         api_key         = get_env("APPWRITE_API_KEY")
         db_id           = get_env("APPWRITE_DATABASE_ID")
         collection_id   = get_env("APPWRITE_COLLECTION_ID")
-        youtube_api_key = get_env("YOUTUBE_API_KEY")
+        yt_api_key      = get_env("YOUTUBE_API_KEY")
         tg_token        = get_env("TELEGRAM_TOKEN")
         tg_channel      = get_env("TELEGRAM_CHANNEL")
     except EnvironmentError as e:
         context.error(str(e))
         return context.res.json({"success": False, "error": str(e)})
 
-    # ── نسخه yt-dlp ──────────────────────────
+    # ── yt-dlp version ───────────────────────
     get_ytdlp_version(context)
 
-    # ── Appwrite ──────────────────────────────
+    # ── Appwrite ─────────────────────────────
     client = Client()
     client.set_endpoint(endpoint)
     client.set_project(project_id)
     client.set_key(api_key)
     databases = Databases(client)
 
-    # ── YouTube API ───────────────────────────
-    youtube = build('youtube', 'v3', developerKey=youtube_api_key)
+    # ── YouTube API ──────────────────────────
+    youtube = build('youtube', 'v3', developerKey=yt_api_key)
 
-    # ── جستجو ─────────────────────────────────
-    search_query = random.choice(SEARCH_QUERIES)
-    context.log(f"🔍 Query: {search_query}")
+    # ── جستجو ────────────────────────────────
+    query = random.choice(SEARCH_QUERIES)
+    context.log(f"🔍 Query: {query}")
 
-    published_after = (
+    pub_after = (
         datetime.utcnow() - timedelta(days=SEARCH_LOOKBACK_DAYS)
     ).isoformat() + "Z"
 
     try:
-        search_response = youtube.search().list(
-            q=search_query,
+        results = youtube.search().list(
+            q=query,
             part='snippet',
             type='video',
             videoDuration='short',
             order='viewCount',
-            publishedAfter=published_after,
+            publishedAfter=pub_after,
             maxResults=50
         ).execute()
     except Exception as e:
         context.error(f"YouTube API Error: {e}")
-        return context.res.json({"success": False, "error": "YouTube API Error"})
+        return context.res.json({"success": False})
 
-    # ── آماده‌سازی استراتژی‌ها ─────────────────
+    items = results.get('items', [])
+    context.log(f"📋 Found {len(items)} videos")
+
+    # ── آماده‌سازی ────────────────────────────
     base_dir    = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
-    strategies  = build_opts_strategies(cookie_path, context)
+    strategies  = build_strategies(cookie_path)
 
-    if os.path.exists(cookie_path):
-        context.log("🍪 cookies.txt found")
-    else:
-        context.log("⚠️  No cookies.txt")
+    cookie_exists = os.path.exists(cookie_path)
+    context.log(
+        f"🍪 cookies.txt: {'found' if cookie_exists else 'NOT FOUND'} | "
+        f"Strategies: {[s[0] for s in strategies]}"
+    )
 
-    context.log(f"🎯 Strategies to try: {[s[0] for s in strategies]}")
+    # ── پردازش ───────────────────────────────
+    posted = 0
+    stats  = {"dup": 0, "long": 0, "no_info": 0, "dl_fail": 0, "tg_fail": 0}
 
-    # ── پردازش ────────────────────────────────
-    videos_posted = 0
-    stats = {
-        "duplicates":     0,
-        "too_long":       0,
-        "no_info":        0,
-        "format_error":   0,
-        "telegram_error": 0,
-    }
-
-    for item in search_response.get('items', []):
-        if videos_posted >= MAX_POSTS_PER_RUN:
+    for item in items:
+        if posted >= MAX_POSTS_PER_RUN:
             break
 
-        video_id  = item['id']['videoId']
+        vid_id    = item['id']['videoId']
         title     = item['snippet']['title']
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        video_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-        if is_video_duplicate(databases, db_id, collection_id, video_id):
-            stats["duplicates"] += 1
+        # ── تکراری؟ ──────────────────────────
+        if is_video_duplicate(databases, db_id, collection_id, vid_id):
+            stats["dup"] += 1
             continue
 
-        context.log(f"\n⬇️  {video_id} — {title[:45]}")
+        context.log(f"\n▶️  {vid_id} — {title[:50]}")
 
-        # ── دریافت اطلاعات با چند استراتژی ────
+        # ── اطلاعات ویدیو ─────────────────────
         info, working_opts = get_video_info(video_url, strategies, context)
 
         if not info:
-            context.log("   ❌ All strategies failed")
+            context.log("   ❌ All strategies failed — skipping")
             stats["no_info"] += 1
+            time.sleep(DELAY_BETWEEN_VIDEOS)
             continue
 
-        # ── بررسی مدت زمان ────────────────────
-        duration = info.get('duration', 0)
-        if duration == 0 or duration > MAX_DURATION_SECONDS:
-            context.log(f"   ⏭️  Duration {duration}s — skipping")
-            stats["too_long"] += 1
+        # ── مدت زمان ─────────────────────────
+        dur = info.get('duration', 0)
+        if dur == 0 or dur > MAX_DURATION_SECONDS:
+            context.log(f"   ⏭️  Duration {dur}s — too long")
+            stats["long"] += 1
             continue
 
-        context.log(f"   ⏱️  Duration: {duration}s — OK")
-
-        # ── دانلود ────────────────────────────
-        file_path = download_video(video_url, video_id, working_opts, context)
+        # ── دانلود ───────────────────────────
+        file_path = download_video(video_url, vid_id, working_opts, context)
 
         if not file_path:
-            stats["format_error"] += 1
+            stats["dl_fail"] += 1
+            time.sleep(DELAY_BETWEEN_VIDEOS)
             continue
 
-        # ── ارسال تلگرام ──────────────────────
-        success = send_to_telegram(
-            tg_token, tg_channel, file_path, title, video_url, context
-        )
+        # ── ارسال تلگرام ─────────────────────
+        ok = send_to_telegram(tg_token, tg_channel, file_path, title, video_url, context)
         cleanup_files([file_path])
 
-        if success:
-            register_video(databases, db_id, collection_id, video_id)
-            videos_posted += 1
-            context.log(f"   ✅ Posted!")
+        if ok:
+            register_video(databases, db_id, collection_id, vid_id)
+            posted += 1
+            context.log(f"   ✅ Posted ({posted}/{MAX_POSTS_PER_RUN})")
         else:
-            stats["telegram_error"] += 1
+            stats["tg_fail"] += 1
 
-    # ── گزارش نهایی ───────────────────────────
+        time.sleep(DELAY_BETWEEN_VIDEOS)
+
+    # ── گزارش ────────────────────────────────
     context.log(
-        f"\n📊 Done | Posted: {videos_posted} | "
-        f"No info: {stats['no_info']} | "
-        f"Duplicates: {stats['duplicates']} | "
-        f"Format: {stats['format_error']} | "
-        f"Telegram: {stats['telegram_error']}"
+        f"\n📊 DONE | posted={posted} | "
+        f"no_info={stats['no_info']} | dup={stats['dup']} | "
+        f"long={stats['long']} | dl_fail={stats['dl_fail']} | "
+        f"tg_fail={stats['tg_fail']}"
     )
 
-    return context.res.json({
-        "success": True,
-        "posted_count": videos_posted,
-        "stats": stats,
-    })
+    return context.res.json({"success": True, "posted": posted, "stats": stats})
