@@ -1,149 +1,326 @@
 import os
+import sys
 import glob
+import logging
 import requests
 import random
 from datetime import datetime, timedelta
+from contextlib import contextmanager
+
 import yt_dlp
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.query import Query
+from appwrite.id import ID
 from googleapiclient.discovery import build
 
+
+# ─────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────
+
+class QuietLogger:
+    """Suppress yt-dlp internal logs."""
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+    def info(self, msg): pass
+
+
+@contextmanager
+def suppress_stderr():
+    """Thread-safer alternative to direct sys.stderr manipulation."""
+    old_stderr = sys.stderr
+    try:
+        with open(os.devnull, 'w') as devnull:
+            sys.stderr = devnull
+            yield
+    finally:
+        sys.stderr = old_stderr
+
+
+def cleanup_files(file_list: list[str]) -> None:
+    """Remove all temporary files safely."""
+    for f in file_list:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except OSError as e:
+            logging.warning(f"Could not remove file {f}: {e}")
+
+
+# ─────────────────────────────────────────────
+# Core Logic
+# ─────────────────────────────────────────────
+
+SEARCH_QUERIES = [
+    "مهندسی مکانیک",
+    "Mechanical Engineering shorts",
+    "Mechanical mechanisms",
+    "Engineering gears animation",
+    "CNC machining process",
+    "Thermodynamics experiment",
+    "Fluid mechanics shorts",
+    "Robotics mechanical design",
+    "manufacturing process satisfying",
+    "hydraulic press machine",
+]
+
+CAPTION_TEMPLATE = (
+    "🎥 **{title}**\n\n"
+    "🔗 [مشاهده در یوتیوب]({url})\n\n"
+    "#مهندسی\\_مکانیک #MechanicalEngineering"
+)
+
+MAX_DURATION_SECONDS = 179   # زیر 3 دقیقه
+MAX_POSTS_PER_RUN    = 2
+SEARCH_LOOKBACK_DAYS = 180
+
+
+def get_env(key: str) -> str:
+    """Read required env var or raise."""
+    value = os.environ.get(key)
+    if not value:
+        raise EnvironmentError(f"Missing required environment variable: {key}")
+    return value
+
+
+def build_ydl_opts(cookie_path: str | None) -> dict:
+    opts = {
+        # اولویت: فرمت یکپارچه mp4 360p → بهترین فرمت یکپارچه
+        'format': '18/b[ext=mp4][vcodec!*=av01]/b[ext=mp4]/b',
+        'outtmpl': '/tmp/%(id)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'logger': QuietLogger(),
+        'noplaylist': True,
+        'extractor_args': {
+            'youtube': {'player_client': ['android', 'web']}
+        },
+        # جلوگیری از دانلود فایل‌های نیازمند merge
+        'merge_output_format': None,
+    }
+    if cookie_path and os.path.exists(cookie_path):
+        opts['cookiefile'] = cookie_path
+    return opts
+
+
+def is_video_duplicate(databases: Databases, db_id: str, col_id: str, video_id: str) -> bool:
+    """Check if video already exists in Appwrite collection."""
+    with suppress_stderr():
+        try:
+            result = databases.list_documents(
+                database_id=db_id,
+                collection_id=col_id,
+                queries=[Query.equal("videoId", video_id)]
+            )
+            return result['total'] > 0
+        except Exception:
+            # در صورت خطای شبکه، محافظه‌کارانه False برمی‌گردانیم
+            return False
+
+
+def register_video(databases: Databases, db_id: str, col_id: str, video_id: str) -> bool:
+    """Save video_id to Appwrite to prevent future duplicates."""
+    with suppress_stderr():
+        try:
+            databases.create_document(
+                database_id=db_id,
+                collection_id=col_id,
+                document_id=ID.unique(),          # ✅ صحیح
+                data={"videoId": video_id}
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Appwrite write failed for {video_id}: {e}")
+            return False
+
+
+def download_video(video_url: str, video_id: str, ydl_opts: dict) -> str | None:
+    """
+    Download video and return file path.
+    Returns None if:
+      - Duration is out of range
+      - No merged/single-stream format available
+      - Any yt-dlp error
+    """
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            if not info:
+                return None
+
+            duration = info.get('duration', 0)
+            if duration == 0 or duration > MAX_DURATION_SECONDS:
+                return None
+
+            # بررسی اینکه آیا فرمت یکپارچه وجود دارد (بدون نیاز به ffmpeg)
+            selected_format = info.get('format_id', '')
+            requested_formats = info.get('requested_formats')
+            if requested_formats and len(requested_formats) > 1:
+                # یعنی yt-dlp می‌خواهد audio+video را merge کند → رد کن
+                return None
+
+            ydl.download([video_url])
+
+    except yt_dlp.utils.DownloadError:
+        return None
+    except Exception:
+        return None
+
+    # یافتن فایل دانلودشده
+    downloaded = glob.glob(f"/tmp/{video_id}.*")
+    valid = [f for f in downloaded if not f.endswith('.part')]
+    return valid[0] if valid else None
+
+
+def send_to_telegram(
+    token: str,
+    channel: str,
+    file_path: str,
+    title: str,
+    video_url: str
+) -> bool:
+    """Upload video to Telegram channel. Returns True on success."""
+    api_url = f"https://api.telegram.org/bot{token}/sendVideo"
+    caption = CAPTION_TEMPLATE.format(title=title, url=video_url)
+
+    try:
+        with open(file_path, 'rb') as video_file:
+            response = requests.post(
+                api_url,
+                data={
+                    "chat_id": channel,
+                    "caption": caption,
+                    "parse_mode": "Markdown",
+                    "supports_streaming": True,
+                },
+                files={"video": video_file},
+                timeout=120,          # ✅ timeout اضافه شد
+            )
+        if response.status_code != 200:
+            logging.warning(f"Telegram API error {response.status_code}: {response.text[:200]}")
+            return False
+        return True
+
+    except requests.RequestException as e:
+        logging.error(f"Telegram request failed: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────
+
 def main(context):
-    context.log("🚀 Starting Bot Execution (Safe Mode)...")
+    context.log("⏰ Bot execution started...")
 
-    # دریافت متغیرهای محیطی
-    endpoint = os.environ.get("APPWRITE_ENDPOINT")
-    project_id = os.environ.get("APPWRITE_PROJECT_ID")
-    appwrite_api_key = os.environ.get("APPWRITE_API_KEY")
-    db_id = os.environ.get("APPWRITE_DATABASE_ID")
-    collection_id = os.environ.get("APPWRITE_COLLECTION_ID")
-    youtube_api_key = os.environ.get("YOUTUBE_API_KEY")
-    telegram_token = os.environ.get("TELEGRAM_TOKEN")
-    telegram_channel = os.environ.get("TELEGRAM_CHANNEL")
+    # ── بارگذاری تنظیمات ──────────────────────
+    try:
+        endpoint        = get_env("APPWRITE_ENDPOINT")
+        project_id      = get_env("APPWRITE_PROJECT_ID")
+        api_key         = get_env("APPWRITE_API_KEY")
+        db_id           = get_env("APPWRITE_DATABASE_ID")
+        collection_id   = get_env("APPWRITE_COLLECTION_ID")
+        youtube_api_key = get_env("YOUTUBE_API_KEY")
+        tg_token        = get_env("TELEGRAM_TOKEN")
+        tg_channel      = get_env("TELEGRAM_CHANNEL")
+    except EnvironmentError as e:
+        context.error(str(e))
+        return context.res.json({"success": False, "error": str(e)})
 
-    # راه اندازی Appwrite
+    # ── راه‌اندازی سرویس‌ها ───────────────────
     client = Client()
     client.set_endpoint(endpoint)
     client.set_project(project_id)
-    client.set_key(appwrite_api_key)
+    client.set_key(api_key)
     databases = Databases(client)
 
-    # راه اندازی YouTube
     youtube = build('youtube', 'v3', developerKey=youtube_api_key)
 
-    # جستجوی ساده و مستقیم
-    search_query = "Mechanical Engineering"
-    context.log(f"🔎 Searching for: {search_query}")
+    # ── جستجوی یوتیوب ─────────────────────────
+    search_query = random.choice(SEARCH_QUERIES)
+    context.log(f"🔍 Query: {search_query}")
+
+    published_after = (
+        datetime.utcnow() - timedelta(days=SEARCH_LOOKBACK_DAYS)
+    ).isoformat() + "Z"
 
     try:
-        # جستجوی ویدیوهای کوتاه و پربازدید
         search_response = youtube.search().list(
             q=search_query,
             part='snippet',
             type='video',
+            videoDuration='short',
             order='viewCount',
-            maxResults=20  # بررسی 20 ویدیوی اول
+            publishedAfter=published_after,
+            maxResults=50
         ).execute()
     except Exception as e:
-        context.error(f"❌ YouTube API Error: {str(e)}")
-        return context.res.json({"success": False})
+        context.error(f"YouTube API Error: {e}")
+        return context.res.json({"success": False, "error": "YouTube API Error"})
 
-    # تنظیمات دانلود مخصوص سرور بدون FFmpeg
-    # کلید موفقیت: format='best[ext=mp4]' یعنی بهترین فایل تکیِ موجود
-    ydl_opts = {
-        'format': 'best[ext=mp4]/best',  # اولویت با فایل تکی MP4 است
-        'outtmpl': '/tmp/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        # این خط بسیار مهم است: جلوگیری از دانلود فرمت‌های جداگانه
-        'match_filter': lambda info, *args, **kwargs: None if info.get('acodec') != 'none' and info.get('vcodec') != 'none' else 'Video is not a single file'
+    # ── آماده‌سازی yt-dlp ──────────────────────
+    base_dir    = os.path.dirname(os.path.abspath(__file__))
+    cookie_path = os.path.join(base_dir, 'cookies.txt')
+    ydl_opts    = build_ydl_opts(cookie_path)
+
+    # ── پردازش ویدیوها ────────────────────────
+    videos_posted = 0
+    stats = {
+        "duplicates":    0,
+        "too_long":      0,
+        "format_error":  0,
+        "telegram_error": 0,
     }
 
-    count = 0
-
     for item in search_response.get('items', []):
-        if count >= 2:  # فقط 2 ویدیو در هر اجرا
+        if videos_posted >= MAX_POSTS_PER_RUN:
             break
 
-        video_id = item['id']['videoId']
-        title = item['snippet']['title']
-        
-        # 1. بررسی تکراری بودن در دیتابیس (با متد صحیح list_documents)
-        try:
-            # توجه: متد list_documents هنوز در پایتون کار می‌کند اما اگر خطای Deprecation دارید
-            # نادیده بگیرید، فعلا کار می‌کند.
-            result = databases.list_documents(
-                database_id=db_id,
-                collection_id=collection_id,
-                queries=[Query.equal("videoId", video_id)]
-            )
-            if result['total'] > 0:
-                context.log(f"⚠️ Duplicate skipped: {video_id}")
-                continue
-        except Exception as e:
-            context.log(f"⚠️ DB Check Error (Ignoring): {str(e)}")
-
-        # 2. تلاش برای دانلود
+        video_id  = item['id']['videoId']
+        title     = item['snippet']['title']
         video_url = f"https://www.youtube.com/watch?v={video_id}"
-        file_path = None
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-                
-                # فیلتر زمان (زیر 3 دقیقه)
-                if info.get('duration', 0) > 180:
-                    continue
 
-                # دانلود واقعی
-                ydl.download([video_url])
-            
-            # پیدا کردن فایل دانلود شده
-            files = glob.glob(f"/tmp/{video_id}.mp4")
-            if not files:
-                # گاهی فرمت mkv دانلود می‌شود اگر mp4 نباشد
-                files = glob.glob(f"/tmp/{video_id}.*")
-            
-            if not files:
-                context.log(f"❌ Download failed (No file): {video_id}")
-                continue
-                
-            file_path = files[0]
-
-        except Exception as e:
-            context.log(f"❌ Download Error for {video_id}: {str(e)}")
+        # ── بررسی تکراری ──────────────────────
+        if is_video_duplicate(databases, db_id, collection_id, video_id):
+            stats["duplicates"] += 1
             continue
 
-        # 3. ارسال به تلگرام
-        try:
-            with open(file_path, 'rb') as f:
-                caption = f"🎥 **{title}**\n\n🔗 {video_url}\n\n#Engineering"
-                url = f"https://api.telegram.org/bot{telegram_token}/sendVideo"
-                payload = {"chat_id": telegram_channel, "caption": caption, "parse_mode": "Markdown"}
-                files_data = {"video": f}
-                
-                resp = requests.post(url, data=payload, files=files_data)
-                
-                if resp.status_code == 200:
-                    # 4. ثبت موفقیت در دیتابیس
-                    databases.create_document(
-                        database_id=db_id,
-                        collection_id=collection_id,
-                        document_id='unique()',
-                        data={"videoId": video_id}
-                    )
-                    context.log(f"✅ POSTED: {title}")
-                    count += 1
-                else:
-                    context.log(f"❌ Telegram Error: {resp.text}")
+        context.log(f"⬇️  Downloading: {video_id}")
 
-        except Exception as e:
-            context.error(f"❌ Upload Error: {str(e)}")
-        
-        # پاکسازی فایل
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+        # ── دانلود ────────────────────────────
+        file_path = download_video(video_url, video_id, ydl_opts)
+        if not file_path:
+            stats["format_error"] += 1
+            # پاکسازی فایل‌های ناقص احتمالی
+            cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
+            continue
 
-    context.log(f"🏁 Finished. Total posted: {count}")
-    return context.res.json({"posted": count})
+        # ── ارسال به تلگرام ───────────────────
+        success = send_to_telegram(tg_token, tg_channel, file_path, title, video_url)
+        cleanup_files([file_path])
+
+        if success:
+            register_video(databases, db_id, collection_id, video_id)
+            videos_posted += 1
+            context.log(f"✅ Posted: {video_id} — {title[:50]}")
+        else:
+            stats["telegram_error"] += 1
+
+    # ── گزارش نهایی ───────────────────────────
+    summary = (
+        f"📊 Run complete | "
+        f"Posted: {videos_posted} | "
+        f"Duplicates: {stats['duplicates']} | "
+        f"Format issues: {stats['format_error']} | "
+        f"Too long: {stats['too_long']} | "
+        f"Telegram errors: {stats['telegram_error']}"
+    )
+    context.log(summary)
+
+    return context.res.json({
+        "success": True,
+        "posted_count": videos_posted,
+        "stats": stats,
+    })
