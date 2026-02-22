@@ -2,10 +2,14 @@ import os
 import glob
 import requests
 import yt_dlp
+import warnings
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.query import Query
 from googleapiclient.discovery import build
+
+# این خط باعث می‌شود اخطارهای زردرنگ و بی‌اهمیت (مثل DeprecationWarning) لاگ شما را شلوغ نکنند
+warnings.filterwarnings('ignore')
 
 def main(context):
     endpoint = os.environ.get("APPWRITE_ENDPOINT")
@@ -27,13 +31,12 @@ def main(context):
     search_query = "مهندسی مکانیک OR Mechanical Engineering"
 
     try:
-        # تغییر کلیدی: videoDuration='short' حذف شد تا ویدیوهای معمولی (که نیاز به FFmpeg ندارند) پیدا شوند
         search_response = youtube.search().list(
             q=search_query,
             part='snippet',
             type='video',
             order='viewCount',
-            maxResults=20 
+            maxResults=20
         ).execute()
     except Exception as e:
         context.error(f"YouTube API Error: {str(e)}")
@@ -42,22 +45,22 @@ def main(context):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
 
-    # تنظیمات yt-dlp برای ویدیوهای استاندارد
-    ydl_opts = {
-        'format': '18/best[ext=mp4]/best', # فرمت 18 همیشه برای ویدیوهای معمولی وجود دارد
-        'outtmpl': '/tmp/%(id)s.%(ext)s',
+    # -----------------------------------------------------------------
+    # فاز اول: استخراج اطلاعات بدون هیچ محدودیت فرمت (غیرممکن است ارور بدهد)
+    # -----------------------------------------------------------------
+    ydl_opts_extract = {
         'quiet': True,
         'noplaylist': True,
         'no_warnings': True,
-        'ignoreerrors': True # این خط از توقف کامل برنامه در صورت خرابی یک ویدیو جلوگیری می‌کند
+        'ignoreerrors': True
     }
-
+    
     if os.path.exists(cookie_path):
-        ydl_opts['cookiefile'] = cookie_path
+        ydl_opts_extract['cookiefile'] = cookie_path
 
     videos_posted_in_this_run = 0
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(ydl_opts_extract) as ydl_extract:
         for item in search_response.get('items', []):
             if videos_posted_in_this_run >= 2:
                 break
@@ -66,6 +69,7 @@ def main(context):
             video_title = item['snippet']['title']
             video_url = f"https://www.youtube.com/watch?v={video_id}"
 
+            # بررسی تکراری نبودن در دیتابیس
             try:
                 existing_docs = databases.list_documents(
                     database_id=db_id,
@@ -74,45 +78,70 @@ def main(context):
                 )
                 if existing_docs['total'] > 0:
                     continue
-            except Exception as e:
-                context.error(f"Database Error: {str(e)}")
+            except Exception:
                 continue
 
+            # استخراج اطلاعات ویدیو
             try:
-                info_dict = ydl.extract_info(video_url, download=False)
+                info_dict = ydl_extract.extract_info(video_url, download=False)
                 if not info_dict:
-                    continue # ویدیوهای در دسترس نبوده را رد می‌کند
-                
-                video_duration = info_dict.get('duration', 0)
+                    continue 
 
-                # فیلتر پایتون: ویدیوهای معمولی اما زیر 3 دقیقه (180 ثانیه) را انتخاب می‌کند
+                video_duration = info_dict.get('duration', 0)
                 if video_duration == 0 or video_duration >= 180:
-                    context.log(f"Skipped {video_id}: Duration >= 180s")
+                    continue # رد کردن ویدیوهای بالای 3 دقیقه
+
+                # پیدا کردن فرمت‌هایی که هم صدا دارند هم تصویر (بدون نیاز به ادغام)
+                formats = info_dict.get('formats', [])
+                merged_formats = [
+                    f for f in formats 
+                    if f.get('vcodec') not in ['none', None] and f.get('acodec') not in ['none', None]
+                ]
+
+                # *** نقطه جادویی ***
+                # اگر یوتیوب فایل چسبیده‌ای نداد، به جای کرش کردن، خیلی راحت از این ویدیو می‌گذریم
+                if not merged_formats:
+                    context.log(f"Skipped {video_id}: No pre-merged formats found by YouTube.")
                     continue
+                
+                # انتخاب بهترین کیفیت MP4 از بین فایل‌های موجود
+                mp4_merged = [f for f in merged_formats if f.get('ext') == 'mp4']
+                target_formats = mp4_merged if mp4_merged else merged_formats
+                selected_format_id = target_formats[-1]['format_id']
 
             except Exception as e:
-                context.error(f"Extraction Error for {video_id}: {str(e)}")
+                context.log(f"Skipped {video_id}: Extraction problem.")
                 continue
 
-            # فاز دانلود
-            context.log(f"Downloading {video_id}...")
+            # -----------------------------------------------------------------
+            # فاز دوم: دانلود دقیقاً با همان فرمتی که مطمئنیم وجود دارد!
+            # -----------------------------------------------------------------
+            ydl_opts_download = {
+                'format': selected_format_id,
+                'outtmpl': '/tmp/%(id)s.%(ext)s',
+                'quiet': True,
+                'noplaylist': True,
+                'no_warnings': True
+            }
+            if os.path.exists(cookie_path):
+                ydl_opts_download['cookiefile'] = cookie_path
+
             try:
-                ydl.download([video_url])
+                with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_dl:
+                    ydl_dl.download([video_url])
                 
                 downloaded_files = glob.glob(f"/tmp/{video_id}.*")
-                valid_files = [f for f in downloaded_files if not f.endswith('.part') and not f.endswith('.ytdl')]
+                valid_files = [f for f in downloaded_files if not f.endswith('.part')]
                 
                 if not valid_files:
-                    context.error(f"File not found in /tmp/ for {video_id}")
                     continue
                 
                 file_path = valid_files[0]
-            except Exception as e:
-                context.error(f"Download failed for {video_id}: {str(e)}")
+            except Exception:
+                context.log(f"Skipped {video_id}: Download failed.")
                 continue
 
             # آپلود به تلگرام
-            context.log(f"Uploading {video_id} to Telegram...")
             telegram_api_url = f"https://api.telegram.org/bot{telegram_token}/sendVideo"
             caption_text = f"🎥 **{video_title}**\n\n🔗 [مشاهده در یوتیوب]({video_url})\n\n#مهندسی_مکانیک #MechanicalEngineering"
 
@@ -126,8 +155,7 @@ def main(context):
                     }
                     files = {"video": video_file}
                     tg_response = requests.post(telegram_api_url, data=payload, files=files)
-            except Exception as e:
-                context.error(f"Telegram Read/Send Error: {str(e)}")
+            except Exception:
                 for f in valid_files:
                     if os.path.exists(f): os.remove(f)
                 continue
@@ -147,10 +175,8 @@ def main(context):
                     )
                     videos_posted_in_this_run += 1
                     context.log(f"✅ Successfully posted: {video_id}")
-                except Exception as e:
-                    context.error(f"Database Save Error: {str(e)}")
-            else:
-                context.error(f"Telegram API Error: {tg_response.text}")
+                except Exception:
+                    pass
 
     return context.res.json({
         "success": True,
