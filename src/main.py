@@ -17,11 +17,6 @@ def main(context):
     telegram_token = os.environ.get("TELEGRAM_TOKEN")
     telegram_channel = os.environ.get("TELEGRAM_CHANNEL")
 
-    # بررسی اولیه متغیرهای محیطی برای جلوگیری از خطاهای گمراه‌کننده
-    if not all([endpoint, project_id, appwrite_api_key, db_id, collection_id]):
-        context.error("Missing one or more Appwrite environment variables.")
-        return context.res.json({"success": False, "error": "Missing Env Vars"})
-
     # تنظیم کلاینت Appwrite
     client = Client()
     client.set_endpoint(endpoint)
@@ -31,6 +26,8 @@ def main(context):
 
     # تنظیم کلاینت یوتیوب
     youtube = build('youtube', 'v3', developerKey=youtube_api_key)
+
+    # جستجو در یوتیوب
     search_query = "مهندسی مکانیک OR Mechanical Engineering"
 
     try:
@@ -40,20 +37,22 @@ def main(context):
             type='video',
             order='viewCount',
             maxResults=15,
-            videoDuration='short'
+            videoDuration='short' # فیلتر اولیه برای جلوگیری از پردازش ویدئوهای طولانی
         ).execute()
     except Exception as e:
         context.error(f"YouTube API Error: {str(e)}")
         return context.res.json({"success": False, "error": "YouTube API Error"})
 
-    # تنظیمات جدید و پیشرفته yt-dlp برای دور زدن آنتی‌بات یوتیوب
+    # تنظیمات yt-dlp (اصلاح شده)
     ydl_opts = {
-        'format': 'best[height<=480][ext=mp4]',
-        'outtmpl': '/tmp/%(id)s.%(ext)s',
+        # اولویت: بهترین فایل یکپارچه mp4 -> بهترین فایل یکپارچه موجود
+        # حرف b به معنای best (فرمت دارای صدا و تصویر باهم) است
+        'format': 'b[ext=mp4]/b',
+        'outtmpl': '/tmp/%(id)s.%(ext)s', # مسیر ذخیره موقت
         'quiet': True,
         'noplaylist': True,
         'no_warnings': True,
-        # ترفند اول: تغییر کلاینت به موبایل برای جلوگیری از بلاک شدن IP سرور
+        # اضافه کردن کلاینت اندروید برای جلوگیری از بلاک شدن مجدد توسط سیستم ضد-ربات یوتیوب
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'web']
@@ -61,18 +60,9 @@ def main(context):
         }
     }
 
-    # ترفند دوم (راه‌حل قطعی): پیدا کردن و استفاده از فایل کوکی مرورگر
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    cookie_path = os.path.join(base_dir, 'cookies.txt')
-    
-    if os.path.exists(cookie_path):
-        ydl_opts['cookiefile'] = cookie_path
-        context.log("✅ فایل cookies.txt پیدا شد و در yt-dlp اعمال گردید.")
-    else:
-        context.log("⚠️ هشدار: فایل cookies.txt یافت نشد! احتمال مسدود شدن توسط یوتیوب وجود دارد.")
-
     videos_posted_in_this_run = 0
 
+    # استفاده از yt-dlp به صورت Context Manager
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         for item in search_response.get('items', []):
             if videos_posted_in_this_run >= 2:
@@ -95,11 +85,12 @@ def main(context):
                 context.error(f"Database Query Error: {str(e)}")
                 continue
 
-            # استخراج اطلاعات ویدئو
+            # استخراج اطلاعات ویدئو با yt-dlp بدون دانلود
             try:
                 info_dict = ydl.extract_info(video_url, download=False)
                 video_duration = info_dict.get('duration', 0)
 
+                # بررسی محدودیت زمانی (کمتر از 3 دقیقه یعنی 180 ثانیه)
                 if video_duration >= 180:
                     context.log(f"Skipped {video_id}: Duration is {video_duration}s (>= 180s)")
                     continue
@@ -112,7 +103,9 @@ def main(context):
             context.log(f"Downloading {video_id}...")
             try:
                 ydl.download([video_url])
-                file_path = f"/tmp/{video_id}.mp4"
+                # پیدا کردن نام فایل بر اساس اکستنشن دانلود شده
+                downloaded_ext = info_dict.get('ext', 'mp4')
+                file_path = f"/tmp/{video_id}.{downloaded_ext}"
             except Exception as e:
                 context.error(f"Download failed for {video_id}: {str(e)}")
                 continue
@@ -128,20 +121,23 @@ def main(context):
                         "chat_id": telegram_channel,
                         "caption": caption_text,
                         "parse_mode": "Markdown",
-                        "supports_streaming": True
+                        "supports_streaming": True # برای پخش آنلاین در تلگرام
                     }
-                    files = {"video": video_file}
+                    files = {
+                        "video": video_file
+                    }
                     tg_response = requests.post(telegram_api_url, data=payload, files=files)
             except Exception as e:
                 context.error(f"Failed to read file {file_path}: {str(e)}")
                 if os.path.exists(file_path): os.remove(file_path)
                 continue
 
-            # پاک کردن فایل موقت
+            # پاک کردن فایل ویدئو از سرور
             if os.path.exists(file_path):
                 os.remove(file_path)
+                context.log(f"Deleted temp file: {file_path}")
 
-            # ثبت در دیتابیس
+            # بررسی نتیجه ارسال تلگرام و ثبت در دیتابیس
             if tg_response.status_code == 200:
                 try:
                     databases.create_document(
