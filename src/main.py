@@ -8,9 +8,6 @@ from appwrite.services.databases import Databases
 from appwrite.query import Query
 from googleapiclient.discovery import build
 
-warnings.filterwarnings('ignore')
-
-# این کلاس به عنوان صداخفه‌کن عمل می‌کند تا ارورهای داخلی yt-dlp لاگ شما را قرمز و شلوغ نکنند
 class QuietLogger:
     def debug(self, msg): pass
     def warning(self, msg): pass
@@ -42,12 +39,13 @@ def main(context):
     youtube = build('youtube', 'v3', developerKey=youtube_api_key)
     search_query = "مهندسی مکانیک OR Mechanical Engineering"
 
-    # افزایش جستجو به 50 نتیجه برای عبور از ویدیوهای Shorts و پیدا کردن ویدیوهای استاندارد
+    # فیلتر جادویی videoDuration='short' اضافه شد تا فقط ویدیوهای کوتاه دریافت شوند
     try:
         search_response = youtube.search().list(
             q=search_query,
             part='snippet',
             type='video',
+            videoDuration='short', # <--- این خط باعث می‌شود 50 نتیجه فقط ویدیوهای زیر 4 دقیقه باشند
             order='viewCount',
             maxResults=50
         ).execute()
@@ -58,7 +56,6 @@ def main(context):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
 
-    # فاز استخراج: با فرمت 'all' و کلاینت اندروید برای جلوگیری از کرش و ارور ربات‌یاب یوتیوب
     ydl_opts_extract = {
         'quiet': True,
         'noplaylist': True,
@@ -87,12 +84,15 @@ def main(context):
             video_title = item['snippet']['title']
             video_url = f"https://www.youtube.com/watch?v={video_id}"
 
+            # مسدود کردن کامل هشدارهای زرد رنگ Appwrite (DeprecationWarning)
             try:
-                existing_docs = databases.list_documents(
-                    database_id=db_id,
-                    collection_id=collection_id,
-                    queries=[Query.equal("videoId", video_id)]
-                )
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    existing_docs = databases.list_documents(
+                        database_id=db_id,
+                        collection_id=collection_id,
+                        queries=[Query.equal("videoId", video_id)]
+                    )
                 if existing_docs['total'] > 0:
                     continue
             except Exception:
@@ -113,7 +113,6 @@ def main(context):
                     if f.get('vcodec') not in ['none', None] and f.get('acodec') not in ['none', None]
                 ]
 
-                # اگر ویدیو Shorts باشد و فرمت چسبیده نداشته باشد، با آرامش رد می‌شود
                 if not merged_formats:
                     continue
 
@@ -177,19 +176,21 @@ def main(context):
 
             if tg_response.status_code == 200:
                 try:
-                    databases.create_document(
-                        database_id=db_id,
-                        collection_id=collection_id,
-                        document_id='unique()',
-                        data={"videoId": video_id}
-                    )
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        databases.create_document(
+                            database_id=db_id,
+                            collection_id=collection_id,
+                            document_id='unique()',
+                            data={"videoId": video_id}
+                        )
                     videos_posted_in_this_run += 1
                     context.log(f"✅ Successfully posted: {video_id}")
                 except Exception:
                     pass
 
     if videos_posted_in_this_run == 0:
-        context.log("ℹ️ No new valid videos (<3 mins, non-Shorts) found in top 50.")
+        context.log("ℹ️ Evaluated 50 short videos, but none met all criteria (or already posted).")
 
     return context.res.json({
         "success": True,
