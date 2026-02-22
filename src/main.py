@@ -42,27 +42,27 @@ def main(context):
         context.error(f"YouTube API Error: {str(e)}")
         return context.res.json({"success": False, "error": "YouTube API Error"})
 
-    # پیدا کردن مسیر دقیق فایل کوکی در سرور
+    # پیدا کردن مسیر فایل کوکی در سرور Appwrite
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
 
-    # تنظیمات جدید yt-dlp (حذف ترفند اندروید + فرمت هوشمند)
-    # با این تنظیمات، یوتیوب فایل‌های یکپارچه (صدا+تصویر) را ارائه می‌دهد
+    # تنظیمات جدید yt-dlp (حذف کامل ترفند اندروید و اصلاح فرمت)
     ydl_opts = {
-        'format': 'best[ext=mp4]/best', # اولویت با بهترین فرمت یکپارچه mp4، در غیر این صورت هر فرمت یکپارچه‌ای که موجود بود
+        # فرمت 18 همان 360p یکپارچه است که تلگرام عالی پخش میکند. اگر نبود سراغ b میرود.
+        'format': '18/b[ext=mp4]/b', 
         'outtmpl': '/tmp/%(id)s.%(ext)s',
         'quiet': True,
         'noplaylist': True,
         'no_warnings': True
-        # ترفند player_client حذف شد تا فایل‌های یکپارچه پنهان نشوند
+        # بخش extractor_args (ترفند اندروید) به طور کامل حذف شد تا یوتیوب فایل‌های یکپارچه را پنهان نکند
     }
 
-    # اعمال کوکی‌ها برای عبور از سد آنتی‌بات
+    # اعمال فایل کوکی در صورت وجود
     if os.path.exists(cookie_path):
         ydl_opts['cookiefile'] = cookie_path
-        context.log("✅ فایل cookies.txt پیدا شد و برای دور زدن ربات اعمال گردید.")
+        context.log("✅ فایل cookies.txt با موفقیت پیدا شد و اعمال گردید.")
     else:
-        context.log("⚠️ هشدار بحرانی: فایل cookies.txt یافت نشد! بدون این فایل، یوتیوب آی‌پی سرور را مسدود خواهد کرد.")
+        context.log("⚠️ هشدار: فایل cookies.txt یافت نشد! شما اکنون فقط به کوکی‌ها متکی هستید.")
 
     videos_posted_in_this_run = 0
 
@@ -75,7 +75,7 @@ def main(context):
             video_title = item['snippet']['title']
             video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-            # بررسی عدم تکرار در دیتابیس
+            # بررسی دیتابیس برای جلوگیری از ارسال تکراری
             try:
                 existing_docs = databases.list_documents(
                     database_id=db_id,
@@ -88,11 +88,12 @@ def main(context):
                 context.error(f"Database Query Error: {str(e)}")
                 continue
 
-            # استخراج اطلاعات ویدئو و بررسی زمان
+            # استخراج اطلاعات بدون دانلود
             try:
                 info_dict = ydl.extract_info(video_url, download=False)
                 video_duration = info_dict.get('duration', 0)
 
+                # محدودیت زمانی (کمتر از ۱۸۰ ثانیه)
                 if video_duration >= 180:
                     context.log(f"Skipped {video_id}: Duration >= 180s")
                     continue
@@ -100,17 +101,17 @@ def main(context):
                 context.error(f"Extraction Error for {video_id}: {str(e)}")
                 continue
 
-            # دانلود هوشمند ویدئو
+            # دانلود ویدئو
             context.log(f"Downloading {video_id}...")
             try:
                 ydl.download([video_url])
                 
-                # پیدا کردن فایل خروجی صرف‌نظر از اینکه چه پسوندی دارد (mp4 یا webm)
+                # استفاده از glob برای پیدا کردن هوشمند فایل (رفع ارور FileNotFoundError)
                 downloaded_files = glob.glob(f"/tmp/{video_id}.*")
                 valid_files = [f for f in downloaded_files if not f.endswith('.part') and not f.endswith('.ytdl')]
                 
                 if not valid_files:
-                    context.error(f"Download completed but file not found in /tmp/ for {video_id}")
+                    context.error(f"Download completed but file not found for {video_id}")
                     continue
                 
                 file_path = valid_files[0]
@@ -118,7 +119,7 @@ def main(context):
                 context.error(f"Download failed for {video_id}: {str(e)}")
                 continue
 
-            # ارسال به تلگرام
+            # آپلود در تلگرام
             context.log(f"Uploading {video_id} to Telegram...")
             telegram_api_url = f"https://api.telegram.org/bot{telegram_token}/sendVideo"
             caption_text = f"🎥 **{video_title}**\n\n🔗 [مشاهده در یوتیوب]({video_url})\n\n#مهندسی_مکانیک #MechanicalEngineering"
@@ -143,7 +144,7 @@ def main(context):
                 if os.path.exists(f):
                     os.remove(f)
 
-            # ثبت موفقیت در دیتابیس
+            # ثبت در Appwrite Database
             if tg_response.status_code == 200:
                 try:
                     databases.create_document(
