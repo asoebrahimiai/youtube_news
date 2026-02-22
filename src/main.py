@@ -115,91 +115,93 @@ def register_video(databases, db_id: str, col_id: str, video_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────
-# Download Logic (No FFmpeg)
+# Download Logic
 # ─────────────────────────────────────────────
 
-def get_best_merged_format(formats: list) -> str | None:
+def check_duration(video_url: str, base_opts: dict) -> int | None:
     """
-    فرمت‌هایی را پیدا می‌کند که از پیش audio+video دارند
-    و نیازی به FFmpeg برای merge ندارند.
+    فقط duration را چک می‌کند — بدون دانلود.
+    None برمی‌گرداند اگر نتوان اطلاعات گرفت.
     """
-    merged = []
-    for f in formats:
-        has_video = f.get('vcodec', 'none') != 'none'
-        has_audio = f.get('acodec', 'none') != 'none'
-        ext_ok    = f.get('ext') in ('mp4', 'webm')
-        size      = f.get('filesize') or f.get('filesize_approx') or 0
-        size_ok   = 0 < size < MAX_FILE_SIZE_BYTES
-
-        if has_video and has_audio and ext_ok and size_ok:
-            merged.append(f)
-
-    if not merged:
-        return None
-
-    # بالاترین bitrate را انتخاب می‌کند
-    best = max(merged, key=lambda f: f.get('tbr') or f.get('vbr') or 0)
-    return best['format_id']
-
-
-def build_base_ydl_opts(cookie_path: str) -> dict:
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'logger': QuietLogger(),
-        'noplaylist': True,
-        'extractor_args': {
-            'youtube': {'player_client': ['android', 'web']}
-        },
+    info_opts = {
+        **base_opts,
+        'format': 'best',
+        'skip_download': True,
     }
-    if cookie_path and os.path.exists(cookie_path):
-        opts['cookiefile'] = cookie_path
-    return opts
+    try:
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            return info.get('duration') if info else None
+    except Exception:
+        return None
 
 
 def download_video(video_url: str, video_id: str, base_opts: dict, context) -> str | None:
+    """
+    ابتدا duration بررسی می‌شود.
+    سپس با فرمت‌های ترتیبی (fallback chain) دانلود انجام می‌شود.
+    هیچ format_id دستی انتخاب نمی‌شود تا مشکل cache رخ ندهد.
+    """
+
+    # ── مرحله ۱: بررسی مدت زمان ──────────────
+    duration = check_duration(video_url, base_opts)
+    if duration is None:
+        context.log(f"⚠️  Cannot get info for {video_id}")
+        return None
+    if duration == 0 or duration > MAX_DURATION_SECONDS:
+        context.log(f"⏭️  Too long ({duration}s): {video_id}")
+        return None
+
+    # ── مرحله ۲: دانلود با fallback chain ─────
+    #
+    # 'best[ext=mp4]'   → بهترین فرمت یکپارچه mp4 (audio+video در یک فایل)
+    # 'best[ext=webm]'  → بهترین فرمت یکپارچه webm
+    # 'best'            → هر فرمت یکپارچه‌ای که موجود باشد
+    #
+    # نکته: 'best' فقط فرمت‌هایی را می‌گیرد که نیازی به merge ندارند.
+    # اگر هیچ‌کدام موجود نباشد → yt-dlp خطای DownloadError می‌دهد.
+    #
+    format_chain = 'best[ext=mp4][filesize<?50M]/best[ext=webm][filesize<?50M]/best[filesize<?50M]/best'
+
+    dl_opts = {
+        **base_opts,
+        'format': format_chain,
+        'outtmpl': '/tmp/%(id)s.%(ext)s',
+        'overwrites': True,
+    }
+
     try:
-        # مرحله ۱: فقط اطلاعات را بگیر (بدون دانلود)
-        info_opts = {**base_opts, 'outtmpl': '/tmp/%(id)s.%(ext)s'}
-        with yt_dlp.YoutubeDL(info_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-
-        if not info:
-            return None
-
-        # مرحله ۲: بررسی مدت زمان
-        duration = info.get('duration', 0)
-        if duration == 0 or duration > MAX_DURATION_SECONDS:
-            return None
-
-        # مرحله ۳: پیدا کردن فرمت یکپارچه
-        formats = info.get('formats', [])
-        format_id = get_best_merged_format(formats)
-
-        if not format_id:
-            context.log(f"⚠️  No merged format for {video_id} (needs FFmpeg)")
-            return None
-
-        # مرحله ۴: دانلود با فرمت انتخاب‌شده
-        dl_opts = {
-            **base_opts,
-            'format': format_id,
-            'outtmpl': '/tmp/%(id)s.%(ext)s',
-        }
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             ydl.download([video_url])
 
     except yt_dlp.utils.DownloadError as e:
-        context.log(f"⚠️  DownloadError {video_id}: {str(e)[:80]}")
-        return None
-    except Exception as e:
-        context.log(f"⚠️  Unexpected error {video_id}: {str(e)[:80]}")
+        err_msg = str(e)[:120]
+        if 'ffmpeg' in err_msg.lower() or 'merger' in err_msg.lower():
+            context.log(f"🚫 FFmpeg required for {video_id} — skipping")
+        else:
+            context.log(f"⚠️  DownloadError {video_id}: {err_msg}")
+        cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
         return None
 
-    # مرحله ۵: یافتن فایل دانلودشده
+    except Exception as e:
+        context.log(f"⚠️  Unexpected error {video_id}: {str(e)[:100]}")
+        cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
+        return None
+
+    # ── مرحله ۳: یافتن فایل دانلودشده ─────────
     downloaded = glob.glob(f"/tmp/{video_id}.*")
-    valid = [f for f in downloaded if not f.endswith('.part')]
-    return valid[0] if valid else None
+    valid = [
+        f for f in downloaded
+        if not f.endswith('.part')
+        and os.path.getsize(f) <= MAX_FILE_SIZE_BYTES
+    ]
+
+    if not valid:
+        context.log(f"⚠️  File not found or too large after download: {video_id}")
+        cleanup_files(downloaded)
+        return None
+
+    return valid[0]
 
 
 # ─────────────────────────────────────────────
@@ -211,7 +213,8 @@ def send_to_telegram(
     channel: str,
     file_path: str,
     title: str,
-    video_url: str
+    video_url: str,
+    context
 ) -> bool:
     api_url = f"https://api.telegram.org/bot{token}/sendVideo"
     caption = CAPTION_TEMPLATE.format(title=title, url=video_url)
@@ -230,15 +233,16 @@ def send_to_telegram(
                 timeout=120,
             )
 
-        if response.status_code != 200:
-            logging.warning(
-                f"Telegram error {response.status_code}: {response.text[:200]}"
-            )
-            return False
-        return True
+        if response.status_code == 200:
+            return True
+
+        context.log(
+            f"⚠️  Telegram HTTP {response.status_code}: {response.text[:200]}"
+        )
+        return False
 
     except requests.RequestException as e:
-        logging.error(f"Telegram request failed: {e}")
+        context.log(f"⚠️  Telegram request failed: {e}")
         return False
 
 
@@ -298,7 +302,18 @@ def main(context):
     # ── آماده‌سازی yt-dlp ─────────────────────
     base_dir    = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
-    base_opts   = build_base_ydl_opts(cookie_path)
+
+    base_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'logger': QuietLogger(),
+        'noplaylist': True,
+        'extractor_args': {
+            'youtube': {'player_client': ['android', 'web']}
+        },
+    }
+    if os.path.exists(cookie_path):
+        base_opts['cookiefile'] = cookie_path
 
     # ── پردازش ویدیوها ────────────────────────
     videos_posted = 0
@@ -322,18 +337,19 @@ def main(context):
             stats["duplicates"] += 1
             continue
 
-        context.log(f"⬇️  Downloading: {video_id}")
+        context.log(f"⬇️  Downloading: {video_id} — {title[:40]}")
 
         # ── دانلود ────────────────────────────
         file_path = download_video(video_url, video_id, base_opts, context)
 
         if not file_path:
             stats["format_error"] += 1
-            cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
             continue
 
         # ── ارسال به تلگرام ───────────────────
-        success = send_to_telegram(tg_token, tg_channel, file_path, title, video_url)
+        success = send_to_telegram(
+            tg_token, tg_channel, file_path, title, video_url, context
+        )
         cleanup_files([file_path])
 
         if success:
