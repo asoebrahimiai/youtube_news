@@ -1,4 +1,5 @@
 import os
+import glob
 import requests
 import yt_dlp
 from appwrite.client import Client
@@ -45,16 +46,17 @@ def main(context):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
 
-    # تنظیمات جدید yt-dlp برای حل مشکل فرمت و ربات
+    # تنظیمات جدید yt-dlp (حل قطعی مشکل فرمت استریم‌های جداگانه)
     ydl_opts = {
-        'format': 'b[ext=mp4]/b',  # حل مشکل ویدئوهای عمودی (Shorts) و فرمت‌ها
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/18/b[ext=mp4]/b', 
+        'merge_output_format': 'mp4',
         'outtmpl': '/tmp/%(id)s.%(ext)s',
         'quiet': True,
         'noplaylist': True,
         'no_warnings': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web']  # ترفند جا زدن به عنوان موبایل
+                'player_client': ['android', 'web']
             }
         }
     }
@@ -107,8 +109,16 @@ def main(context):
             context.log(f"Downloading {video_id}...")
             try:
                 ydl.download([video_url])
-                downloaded_ext = info_dict.get('ext', 'mp4')
-                file_path = f"/tmp/{video_id}.{downloaded_ext}"
+                
+                # پیدا کردن هوشمند فایل دانلود شده صرف‌نظر از پسوند نهایی
+                downloaded_files = glob.glob(f"/tmp/{video_id}.*")
+                valid_files = [f for f in downloaded_files if not f.endswith('.part') and not f.endswith('.ytdl')]
+                
+                if not valid_files:
+                    context.error(f"Download completed but file not found for {video_id}")
+                    continue
+                
+                file_path = valid_files[0]
             except Exception as e:
                 context.error(f"Download failed for {video_id}: {str(e)}")
                 continue
@@ -134,8 +144,9 @@ def main(context):
                 continue
 
             # پاکسازی سرور
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            for f in valid_files:
+                if os.path.exists(f):
+                    os.remove(f)
 
             # ثبت در Appwrite Database
             if tg_response.status_code == 200:
