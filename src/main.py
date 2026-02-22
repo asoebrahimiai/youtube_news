@@ -115,19 +115,48 @@ def register_video(databases, db_id: str, col_id: str, video_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────
+# yt-dlp Options Builder
+# ─────────────────────────────────────────────
+
+def build_base_opts(cookie_path: str) -> dict:
+    """
+    چندین player_client را امتحان می‌کند تا از bot detection
+    یوتیوب عبور کند. cookies نیز اضافه می‌شود اگر موجود باشد.
+    """
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'logger': QuietLogger(),
+        'noplaylist': True,
+        # ترتیب مهم است: tv و mweb کمتر تحت نظر یوتیوب هستند
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['tv', 'mweb', 'android', 'web'],
+            }
+        },
+        # هدرهای مرورگر واقعی برای کاهش شناسایی
+        'http_headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (Linux; Android 12; Pixel 6) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/112.0.0.0 Mobile Safari/537.36'
+            ),
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+    }
+
+    if cookie_path and os.path.exists(cookie_path):
+        opts['cookiefile'] = cookie_path
+
+    return opts
+
+
+# ─────────────────────────────────────────────
 # Download Logic
 # ─────────────────────────────────────────────
 
 def check_duration(video_url: str, base_opts: dict) -> int | None:
-    """
-    فقط duration را چک می‌کند — بدون دانلود.
-    None برمی‌گرداند اگر نتوان اطلاعات گرفت.
-    """
-    info_opts = {
-        **base_opts,
-        'format': 'best',
-        'skip_download': True,
-    }
+    info_opts = {**base_opts, 'skip_download': True}
     try:
         with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
@@ -137,31 +166,25 @@ def check_duration(video_url: str, base_opts: dict) -> int | None:
 
 
 def download_video(video_url: str, video_id: str, base_opts: dict, context) -> str | None:
-    """
-    ابتدا duration بررسی می‌شود.
-    سپس با فرمت‌های ترتیبی (fallback chain) دانلود انجام می‌شود.
-    هیچ format_id دستی انتخاب نمی‌شود تا مشکل cache رخ ندهد.
-    """
 
     # ── مرحله ۱: بررسی مدت زمان ──────────────
     duration = check_duration(video_url, base_opts)
+
     if duration is None:
         context.log(f"⚠️  Cannot get info for {video_id}")
         return None
+
     if duration == 0 or duration > MAX_DURATION_SECONDS:
         context.log(f"⏭️  Too long ({duration}s): {video_id}")
         return None
 
-    # ── مرحله ۲: دانلود با fallback chain ─────
-    #
-    # 'best[ext=mp4]'   → بهترین فرمت یکپارچه mp4 (audio+video در یک فایل)
-    # 'best[ext=webm]'  → بهترین فرمت یکپارچه webm
-    # 'best'            → هر فرمت یکپارچه‌ای که موجود باشد
-    #
-    # نکته: 'best' فقط فرمت‌هایی را می‌گیرد که نیازی به merge ندارند.
-    # اگر هیچ‌کدام موجود نباشد → yt-dlp خطای DownloadError می‌دهد.
-    #
-    format_chain = 'best[ext=mp4][filesize<?50M]/best[ext=webm][filesize<?50M]/best[filesize<?50M]/best'
+    # ── مرحله ۲: دانلود ───────────────────────
+    format_chain = (
+        'best[ext=mp4][filesize<?50M]'
+        '/best[ext=webm][filesize<?50M]'
+        '/best[filesize<?50M]'
+        '/best'
+    )
 
     dl_opts = {
         **base_opts,
@@ -175,9 +198,9 @@ def download_video(video_url: str, video_id: str, base_opts: dict, context) -> s
             ydl.download([video_url])
 
     except yt_dlp.utils.DownloadError as e:
-        err_msg = str(e)[:120]
+        err_msg = str(e)[:150]
         if 'ffmpeg' in err_msg.lower() or 'merger' in err_msg.lower():
-            context.log(f"🚫 FFmpeg required for {video_id} — skipping")
+            context.log(f"🚫 FFmpeg required for {video_id}")
         else:
             context.log(f"⚠️  DownloadError {video_id}: {err_msg}")
         cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
@@ -188,7 +211,7 @@ def download_video(video_url: str, video_id: str, base_opts: dict, context) -> s
         cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
         return None
 
-    # ── مرحله ۳: یافتن فایل دانلودشده ─────────
+    # ── مرحله ۳: یافتن فایل ───────────────────
     downloaded = glob.glob(f"/tmp/{video_id}.*")
     valid = [
         f for f in downloaded
@@ -197,7 +220,7 @@ def download_video(video_url: str, video_id: str, base_opts: dict, context) -> s
     ]
 
     if not valid:
-        context.log(f"⚠️  File not found or too large after download: {video_id}")
+        context.log(f"⚠️  File missing or too large: {video_id}")
         cleanup_files(downloaded)
         return None
 
@@ -236,9 +259,7 @@ def send_to_telegram(
         if response.status_code == 200:
             return True
 
-        context.log(
-            f"⚠️  Telegram HTTP {response.status_code}: {response.text[:200]}"
-        )
+        context.log(f"⚠️  Telegram HTTP {response.status_code}: {response.text[:200]}")
         return False
 
     except requests.RequestException as e:
@@ -302,18 +323,12 @@ def main(context):
     # ── آماده‌سازی yt-dlp ─────────────────────
     base_dir    = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
+    base_opts   = build_base_opts(cookie_path)
 
-    base_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'logger': QuietLogger(),
-        'noplaylist': True,
-        'extractor_args': {
-            'youtube': {'player_client': ['android', 'web']}
-        },
-    }
     if os.path.exists(cookie_path):
-        base_opts['cookiefile'] = cookie_path
+        context.log("🍪 cookies.txt found — using authenticated session")
+    else:
+        context.log("⚠️  No cookies.txt — YouTube may block requests")
 
     # ── پردازش ویدیوها ────────────────────────
     videos_posted = 0
