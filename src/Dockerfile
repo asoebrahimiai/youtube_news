@@ -1,11 +1,19 @@
 FROM openruntimes/python:v4-3.11
 
-WORKDIR /usr/local/server/src/function
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-
+# Install/Update yt-dlp to latest version
 RUN pip install --upgrade pip && \
-    pip install "yt-dlp>=2024.11.18" && \
-    pip install -r requirements.txt
+    pip install --upgrade yt-dlp && \
+    yt-dlp --version
 
-COPY . .
+# Verify installation
+RUN python3 -c "import yt_dlp; print('yt-dlp version:', yt_dlp.version.__version__)"
+
+WORKDIR /usr/local/server
