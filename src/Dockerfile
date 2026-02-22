@@ -1,19 +1,18 @@
-FROM openruntimes/python:v4-3.11
+FROM python:3.11-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    curl \
-    wget \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# نصب ffmpeg و ابزارهای ضروری
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        curl \
+        ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
 
-# Install/Update yt-dlp to latest version
-RUN pip install --upgrade pip && \
-    pip install --upgrade yt-dlp && \
-    yt-dlp --version
+WORKDIR /usr/local/lib/python3.11/site-packages/openruntimes
 
-# Verify installation
-RUN python3 -c "import yt_dlp; print('yt-dlp version:', yt_dlp.version.__version__)"
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --upgrade yt-dlp
 
-WORKDIR /usr/local/server
+COPY . .
