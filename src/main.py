@@ -8,10 +8,23 @@ from appwrite.services.databases import Databases
 from appwrite.query import Query
 from googleapiclient.discovery import build
 
-# این خط باعث می‌شود اخطارهای زردرنگ و بی‌اهمیت (مثل DeprecationWarning) لاگ شما را شلوغ نکنند
+# این خط باعث می‌شود اخطارهای زردرنگ و بی‌اهمیت مثل DeprecationWarning لاگ را شلوغ نکنند
 warnings.filterwarnings('ignore')
 
 def main(context):
+    # -----------------------------------------------------------------
+    # بخش اجرای خودکار (تشخیص دلیل اجرای تابع)
+    # -----------------------------------------------------------------
+    # بررسی می‌کنیم که آیا تابع به خاطر Deploy جدید اجرا شده یا زمان‌بندی
+    event = context.req.headers.get('x-appwrite-event', '')
+    if 'deployments' in event and 'create' in event:
+        context.log("🚀 New Deployment Detected! Auto-executing the bot...")
+    else:
+        context.log("⏰ Scheduled or Manual trigger started.")
+
+    # -----------------------------------------------------------------
+    # تنظیمات اولیه و اتصال به دیتابیس
+    # -----------------------------------------------------------------
     endpoint = os.environ.get("APPWRITE_ENDPOINT")
     project_id = os.environ.get("APPWRITE_PROJECT_ID")
     appwrite_api_key = os.environ.get("APPWRITE_API_KEY")
@@ -46,7 +59,7 @@ def main(context):
     cookie_path = os.path.join(base_dir, 'cookies.txt')
 
     # -----------------------------------------------------------------
-    # فاز اول: استخراج اطلاعات بدون هیچ محدودیت فرمت (غیرممکن است ارور بدهد)
+    # فاز اول: استخراج اطلاعات بدون هیچ محدودیت فرمت (ضد-کرش)
     # -----------------------------------------------------------------
     ydl_opts_extract = {
         'quiet': True,
@@ -91,20 +104,18 @@ def main(context):
                 if video_duration == 0 or video_duration >= 180:
                     continue # رد کردن ویدیوهای بالای 3 دقیقه
 
-                # پیدا کردن فرمت‌هایی که هم صدا دارند هم تصویر (بدون نیاز به ادغام)
+                # پیدا کردن فرمت‌هایی که هم صدا دارند هم تصویر (یکپارچه)
                 formats = info_dict.get('formats', [])
                 merged_formats = [
                     f for f in formats 
                     if f.get('vcodec') not in ['none', None] and f.get('acodec') not in ['none', None]
                 ]
 
-                # *** نقطه جادویی ***
-                # اگر یوتیوب فایل چسبیده‌ای نداد، به جای کرش کردن، خیلی راحت از این ویدیو می‌گذریم
                 if not merged_formats:
                     context.log(f"Skipped {video_id}: No pre-merged formats found by YouTube.")
                     continue
                 
-                # انتخاب بهترین کیفیت MP4 از بین فایل‌های موجود
+                # انتخاب بهترین کیفیت MP4 از بین فایل‌های یکپارچه موجود
                 mp4_merged = [f for f in merged_formats if f.get('ext') == 'mp4']
                 target_formats = mp4_merged if mp4_merged else merged_formats
                 selected_format_id = target_formats[-1]['format_id']
@@ -114,7 +125,7 @@ def main(context):
                 continue
 
             # -----------------------------------------------------------------
-            # فاز دوم: دانلود دقیقاً با همان فرمتی که مطمئنیم وجود دارد!
+            # فاز دوم: دانلود دقیقاً با همان فرمتی که یوتیوب به ما داده است
             # -----------------------------------------------------------------
             ydl_opts_download = {
                 'format': selected_format_id,
@@ -126,6 +137,7 @@ def main(context):
             if os.path.exists(cookie_path):
                 ydl_opts_download['cookiefile'] = cookie_path
 
+            context.log(f"Downloading {video_id} (Format: {selected_format_id})...")
             try:
                 with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_dl:
                     ydl_dl.download([video_url])
@@ -138,7 +150,7 @@ def main(context):
                 
                 file_path = valid_files[0]
             except Exception:
-                context.log(f"Skipped {video_id}: Download failed.")
+                context.error(f"Download failed for {video_id}.")
                 continue
 
             # آپلود به تلگرام
@@ -180,5 +192,6 @@ def main(context):
 
     return context.res.json({
         "success": True,
-        "posted_count": videos_posted_in_this_run
+        "posted_count": videos_posted_in_this_run,
+        "trigger": event if event else "schedule/manual"
     })
