@@ -16,41 +16,7 @@ from googleapiclient.discovery import build
 
 
 # ─────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────
-
-class QuietLogger:
-    """Suppress yt-dlp internal logs."""
-    def debug(self, msg): pass
-    def warning(self, msg): pass
-    def error(self, msg): pass
-    def info(self, msg): pass
-
-
-@contextmanager
-def suppress_stderr():
-    """Thread-safer alternative to direct sys.stderr manipulation."""
-    old_stderr = sys.stderr
-    try:
-        with open(os.devnull, 'w') as devnull:
-            sys.stderr = devnull
-            yield
-    finally:
-        sys.stderr = old_stderr
-
-
-def cleanup_files(file_list: list[str]) -> None:
-    """Remove all temporary files safely."""
-    for f in file_list:
-        try:
-            if os.path.exists(f):
-                os.remove(f)
-        except OSError as e:
-            logging.warning(f"Could not remove file {f}: {e}")
-
-
-# ─────────────────────────────────────────────
-# Core Logic
+# Constants
 # ─────────────────────────────────────────────
 
 SEARCH_QUERIES = [
@@ -72,41 +38,55 @@ CAPTION_TEMPLATE = (
     "#مهندسی\\_مکانیک #MechanicalEngineering"
 )
 
-MAX_DURATION_SECONDS = 179   # زیر 3 دقیقه
+MAX_DURATION_SECONDS = 179
 MAX_POSTS_PER_RUN    = 2
 SEARCH_LOOKBACK_DAYS = 180
+MAX_FILE_SIZE_BYTES  = 50 * 1024 * 1024  # 50MB
+
+
+# ─────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────
+
+class QuietLogger:
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+    def info(self, msg): pass
+
+
+@contextmanager
+def suppress_stderr():
+    old_stderr = sys.stderr
+    try:
+        with open(os.devnull, 'w') as devnull:
+            sys.stderr = devnull
+            yield
+    finally:
+        sys.stderr = old_stderr
+
+
+def cleanup_files(file_list: list) -> None:
+    for f in file_list:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except OSError as e:
+            logging.warning(f"Could not remove file {f}: {e}")
 
 
 def get_env(key: str) -> str:
-    """Read required env var or raise."""
     value = os.environ.get(key)
     if not value:
         raise EnvironmentError(f"Missing required environment variable: {key}")
     return value
 
 
-def build_ydl_opts(cookie_path: str | None) -> dict:
-    opts = {
-        # اولویت: فرمت یکپارچه mp4 360p → بهترین فرمت یکپارچه
-        'format': '18/b[ext=mp4][vcodec!*=av01]/b[ext=mp4]/b',
-        'outtmpl': '/tmp/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'logger': QuietLogger(),
-        'noplaylist': True,
-        'extractor_args': {
-            'youtube': {'player_client': ['android', 'web']}
-        },
-        # جلوگیری از دانلود فایل‌های نیازمند merge
-        'merge_output_format': None,
-    }
-    if cookie_path and os.path.exists(cookie_path):
-        opts['cookiefile'] = cookie_path
-    return opts
+# ─────────────────────────────────────────────
+# Appwrite Helpers
+# ─────────────────────────────────────────────
 
-
-def is_video_duplicate(databases: Databases, db_id: str, col_id: str, video_id: str) -> bool:
-    """Check if video already exists in Appwrite collection."""
+def is_video_duplicate(databases, db_id: str, col_id: str, video_id: str) -> bool:
     with suppress_stderr():
         try:
             result = databases.list_documents(
@@ -116,18 +96,16 @@ def is_video_duplicate(databases: Databases, db_id: str, col_id: str, video_id: 
             )
             return result['total'] > 0
         except Exception:
-            # در صورت خطای شبکه، محافظه‌کارانه False برمی‌گردانیم
             return False
 
 
-def register_video(databases: Databases, db_id: str, col_id: str, video_id: str) -> bool:
-    """Save video_id to Appwrite to prevent future duplicates."""
+def register_video(databases, db_id: str, col_id: str, video_id: str) -> bool:
     with suppress_stderr():
         try:
             databases.create_document(
                 database_id=db_id,
                 collection_id=col_id,
-                document_id=ID.unique(),          # ✅ صحیح
+                document_id=ID.unique(),
                 data={"videoId": video_id}
             )
             return True
@@ -136,43 +114,97 @@ def register_video(databases: Databases, db_id: str, col_id: str, video_id: str)
             return False
 
 
-def download_video(video_url: str, video_id: str, ydl_opts: dict) -> str | None:
+# ─────────────────────────────────────────────
+# Download Logic (No FFmpeg)
+# ─────────────────────────────────────────────
+
+def get_best_merged_format(formats: list) -> str | None:
     """
-    Download video and return file path.
-    Returns None if:
-      - Duration is out of range
-      - No merged/single-stream format available
-      - Any yt-dlp error
+    فرمت‌هایی را پیدا می‌کند که از پیش audio+video دارند
+    و نیازی به FFmpeg برای merge ندارند.
     """
+    merged = []
+    for f in formats:
+        has_video = f.get('vcodec', 'none') != 'none'
+        has_audio = f.get('acodec', 'none') != 'none'
+        ext_ok    = f.get('ext') in ('mp4', 'webm')
+        size      = f.get('filesize') or f.get('filesize_approx') or 0
+        size_ok   = 0 < size < MAX_FILE_SIZE_BYTES
+
+        if has_video and has_audio and ext_ok and size_ok:
+            merged.append(f)
+
+    if not merged:
+        return None
+
+    # بالاترین bitrate را انتخاب می‌کند
+    best = max(merged, key=lambda f: f.get('tbr') or f.get('vbr') or 0)
+    return best['format_id']
+
+
+def build_base_ydl_opts(cookie_path: str) -> dict:
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'logger': QuietLogger(),
+        'noplaylist': True,
+        'extractor_args': {
+            'youtube': {'player_client': ['android', 'web']}
+        },
+    }
+    if cookie_path and os.path.exists(cookie_path):
+        opts['cookiefile'] = cookie_path
+    return opts
+
+
+def download_video(video_url: str, video_id: str, base_opts: dict, context) -> str | None:
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # مرحله ۱: فقط اطلاعات را بگیر (بدون دانلود)
+        info_opts = {**base_opts, 'outtmpl': '/tmp/%(id)s.%(ext)s'}
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
-            if not info:
-                return None
 
-            duration = info.get('duration', 0)
-            if duration == 0 or duration > MAX_DURATION_SECONDS:
-                return None
+        if not info:
+            return None
 
-            # بررسی اینکه آیا فرمت یکپارچه وجود دارد (بدون نیاز به ffmpeg)
-            selected_format = info.get('format_id', '')
-            requested_formats = info.get('requested_formats')
-            if requested_formats and len(requested_formats) > 1:
-                # یعنی yt-dlp می‌خواهد audio+video را merge کند → رد کن
-                return None
+        # مرحله ۲: بررسی مدت زمان
+        duration = info.get('duration', 0)
+        if duration == 0 or duration > MAX_DURATION_SECONDS:
+            return None
 
+        # مرحله ۳: پیدا کردن فرمت یکپارچه
+        formats = info.get('formats', [])
+        format_id = get_best_merged_format(formats)
+
+        if not format_id:
+            context.log(f"⚠️  No merged format for {video_id} (needs FFmpeg)")
+            return None
+
+        # مرحله ۴: دانلود با فرمت انتخاب‌شده
+        dl_opts = {
+            **base_opts,
+            'format': format_id,
+            'outtmpl': '/tmp/%(id)s.%(ext)s',
+        }
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
             ydl.download([video_url])
 
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
+        context.log(f"⚠️  DownloadError {video_id}: {str(e)[:80]}")
         return None
-    except Exception:
+    except Exception as e:
+        context.log(f"⚠️  Unexpected error {video_id}: {str(e)[:80]}")
         return None
 
-    # یافتن فایل دانلودشده
+    # مرحله ۵: یافتن فایل دانلودشده
     downloaded = glob.glob(f"/tmp/{video_id}.*")
     valid = [f for f in downloaded if not f.endswith('.part')]
     return valid[0] if valid else None
 
+
+# ─────────────────────────────────────────────
+# Telegram
+# ─────────────────────────────────────────────
 
 def send_to_telegram(
     token: str,
@@ -181,7 +213,6 @@ def send_to_telegram(
     title: str,
     video_url: str
 ) -> bool:
-    """Upload video to Telegram channel. Returns True on success."""
     api_url = f"https://api.telegram.org/bot{token}/sendVideo"
     caption = CAPTION_TEMPLATE.format(title=title, url=video_url)
 
@@ -196,10 +227,13 @@ def send_to_telegram(
                     "supports_streaming": True,
                 },
                 files={"video": video_file},
-                timeout=120,          # ✅ timeout اضافه شد
+                timeout=120,
             )
+
         if response.status_code != 200:
-            logging.warning(f"Telegram API error {response.status_code}: {response.text[:200]}")
+            logging.warning(
+                f"Telegram error {response.status_code}: {response.text[:200]}"
+            )
             return False
         return True
 
@@ -209,13 +243,13 @@ def send_to_telegram(
 
 
 # ─────────────────────────────────────────────
-# Entry Point
+# Main Entry Point
 # ─────────────────────────────────────────────
 
 def main(context):
     context.log("⏰ Bot execution started...")
 
-    # ── بارگذاری تنظیمات ──────────────────────
+    # ── بارگذاری متغیرهای محیطی ──────────────
     try:
         endpoint        = get_env("APPWRITE_ENDPOINT")
         project_id      = get_env("APPWRITE_PROJECT_ID")
@@ -229,16 +263,17 @@ def main(context):
         context.error(str(e))
         return context.res.json({"success": False, "error": str(e)})
 
-    # ── راه‌اندازی سرویس‌ها ───────────────────
+    # ── راه‌اندازی Appwrite ───────────────────
     client = Client()
     client.set_endpoint(endpoint)
     client.set_project(project_id)
     client.set_key(api_key)
     databases = Databases(client)
 
+    # ── راه‌اندازی YouTube API ────────────────
     youtube = build('youtube', 'v3', developerKey=youtube_api_key)
 
-    # ── جستجوی یوتیوب ─────────────────────────
+    # ── جستجو در یوتیوب ──────────────────────
     search_query = random.choice(SEARCH_QUERIES)
     context.log(f"🔍 Query: {search_query}")
 
@@ -260,17 +295,17 @@ def main(context):
         context.error(f"YouTube API Error: {e}")
         return context.res.json({"success": False, "error": "YouTube API Error"})
 
-    # ── آماده‌سازی yt-dlp ──────────────────────
+    # ── آماده‌سازی yt-dlp ─────────────────────
     base_dir    = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
-    ydl_opts    = build_ydl_opts(cookie_path)
+    base_opts   = build_base_ydl_opts(cookie_path)
 
     # ── پردازش ویدیوها ────────────────────────
     videos_posted = 0
     stats = {
-        "duplicates":    0,
-        "too_long":      0,
-        "format_error":  0,
+        "duplicates":     0,
+        "too_long":       0,
+        "format_error":   0,
         "telegram_error": 0,
     }
 
@@ -282,7 +317,7 @@ def main(context):
         title     = item['snippet']['title']
         video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # ── بررسی تکراری ──────────────────────
+        # ── بررسی تکراری بودن ─────────────────
         if is_video_duplicate(databases, db_id, collection_id, video_id):
             stats["duplicates"] += 1
             continue
@@ -290,10 +325,10 @@ def main(context):
         context.log(f"⬇️  Downloading: {video_id}")
 
         # ── دانلود ────────────────────────────
-        file_path = download_video(video_url, video_id, ydl_opts)
+        file_path = download_video(video_url, video_id, base_opts, context)
+
         if not file_path:
             stats["format_error"] += 1
-            # پاکسازی فایل‌های ناقص احتمالی
             cleanup_files(glob.glob(f"/tmp/{video_id}.*"))
             continue
 
@@ -309,7 +344,7 @@ def main(context):
             stats["telegram_error"] += 1
 
     # ── گزارش نهایی ───────────────────────────
-    summary = (
+    context.log(
         f"📊 Run complete | "
         f"Posted: {videos_posted} | "
         f"Duplicates: {stats['duplicates']} | "
@@ -317,7 +352,6 @@ def main(context):
         f"Too long: {stats['too_long']} | "
         f"Telegram errors: {stats['telegram_error']}"
     )
-    context.log(summary)
 
     return context.res.json({
         "success": True,
