@@ -58,20 +58,16 @@ def main(context):
 
     # تنظیمات yt-dlp
     # فرمت: بهترین ویدیوی یکپارچه (صدا+تصویر) با ارتفاع حداکثر 480 پیکسل و فرمت mp4
-        # تنظیمات yt-dlp به همراه ترفند دور زدن ضد-ربات یوتیوب
+    
     ydl_opts = {
         'format': 'best[height<=480][ext=mp4]',
         'outtmpl': '/tmp/%(id)s.%(ext)s',
+        'cookiefile': 'cookies.txt',  # <--- اضافه شدن مسیر فایل کوکی
         'quiet': True,
         'noplaylist': True,
-        'no_warnings': True,
-        # این بخش به یوتیوب می‌گوید که درخواست از طرف یک گوشی اندرویدی است نه سرور
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web']
-            }
-        }
+        'no_warnings': True
     }
+
 
 
     videos_posted_in_this_run = 0
