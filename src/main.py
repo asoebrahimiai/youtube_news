@@ -1,8 +1,11 @@
+# این دو خط باید دقیقاً در ابتدای فایل باشند تا تمام اخطارهای مزاحم Appwrite خاموش شوند
+import warnings
+warnings.filterwarnings("ignore")
+
 import os
 import glob
 import requests
 import yt_dlp
-import warnings
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.query import Query
@@ -15,12 +18,9 @@ class QuietLogger:
     def info(self, msg): pass
 
 def main(context):
-    event = context.req.headers.get('x-appwrite-event', '')
-    if 'deployments' in event and 'create' in event:
-        context.log("🚀 Auto-trigger detected from deployment.")
-    else:
-        context.log("⏰ Bot execution started (Scheduled/Manual).")
+    context.log("⏰ Bot execution started...")
 
+    # تنظیمات اولیه
     endpoint = os.environ.get("APPWRITE_ENDPOINT")
     project_id = os.environ.get("APPWRITE_PROJECT_ID")
     appwrite_api_key = os.environ.get("APPWRITE_API_KEY")
@@ -39,13 +39,13 @@ def main(context):
     youtube = build('youtube', 'v3', developerKey=youtube_api_key)
     search_query = "مهندسی مکانیک OR Mechanical Engineering"
 
-    # فیلتر جادویی videoDuration='short' اضافه شد تا فقط ویدیوهای کوتاه دریافت شوند
+    # جستجوی 50 ویدیوی ترند و کوتاه
     try:
         search_response = youtube.search().list(
             q=search_query,
             part='snippet',
             type='video',
-            videoDuration='short', # <--- این خط باعث می‌شود 50 نتیجه فقط ویدیوهای زیر 4 دقیقه باشند
+            videoDuration='short',
             order='viewCount',
             maxResults=50
         ).execute()
@@ -56,26 +56,20 @@ def main(context):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cookie_path = os.path.join(base_dir, 'cookies.txt')
 
-    ydl_opts_extract = {
+    # فاز 1: فقط استخراج اطلاعات پایه (سریع و بدون دانلود)
+    ydl_opts_info = {
         'quiet': True,
         'noplaylist': True,
         'no_warnings': True,
-        'ignoreerrors': True,
-        'format': 'all',
         'logger': QuietLogger(),
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web']
-            }
-        }
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
     }
-
     if os.path.exists(cookie_path):
-        ydl_opts_extract['cookiefile'] = cookie_path
+        ydl_opts_info['cookiefile'] = cookie_path
 
     videos_posted_in_this_run = 0
 
-    with yt_dlp.YoutubeDL(ydl_opts_extract) as ydl_extract:
+    with yt_dlp.YoutubeDL(ydl_opts_info) as ydl_info:
         for item in search_response.get('items', []):
             if videos_posted_in_this_run >= 2:
                 break
@@ -84,57 +78,39 @@ def main(context):
             video_title = item['snippet']['title']
             video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-            # مسدود کردن کامل هشدارهای زرد رنگ Appwrite (DeprecationWarning)
+            # بررسی تکراری نبودن (اخطارهای Appwrite قبلاً توسط خط 3 مسدود شده‌اند)
             try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    existing_docs = databases.list_documents(
-                        database_id=db_id,
-                        collection_id=collection_id,
-                        queries=[Query.equal("videoId", video_id)]
-                    )
+                existing_docs = databases.list_documents(
+                    database_id=db_id,
+                    collection_id=collection_id,
+                    queries=[Query.equal("videoId", video_id)]
+                )
                 if existing_docs['total'] > 0:
                     continue
             except Exception:
                 continue
 
+            # استخراج اطلاعات و بررسی زمان ویدیو
             try:
-                info_dict = ydl_extract.extract_info(video_url, download=False)
-                if not info_dict:
+                info_dict = ydl_info.extract_info(video_url, download=False)
+                if not info_dict: continue
+                
+                duration = info_dict.get('duration', 0)
+                if duration == 0 or duration >= 180:
                     continue
-
-                video_duration = info_dict.get('duration', 0)
-                if video_duration == 0 or video_duration >= 180:
-                    continue 
-
-                formats = info_dict.get('formats', [])
-                merged_formats = [
-                    f for f in formats
-                    if f.get('vcodec') not in ['none', None] and f.get('acodec') not in ['none', None]
-                ]
-
-                if not merged_formats:
-                    continue
-
-                mp4_merged = [f for f in merged_formats if f.get('ext') == 'mp4']
-                target_formats = mp4_merged if mp4_merged else merged_formats
-                selected_format_id = target_formats[-1]['format_id']
-
             except Exception:
                 continue
 
+            # فاز 2: دانلود هوشمند.
+            # فرمت 'best[ext=mp4]' به صورت خودکار فایلی را پیدا می‌کند که از قبل صدا و تصویر را با هم دارد.
             ydl_opts_download = {
-                'format': selected_format_id,
+                'format': 'best[ext=mp4]', 
                 'outtmpl': '/tmp/%(id)s.%(ext)s',
                 'quiet': True,
                 'noplaylist': True,
                 'no_warnings': True,
                 'logger': QuietLogger(),
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'web']
-                    }
-                }
+                'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
             }
             if os.path.exists(cookie_path):
                 ydl_opts_download['cookiefile'] = cookie_path
@@ -150,8 +126,11 @@ def main(context):
                     continue
                 file_path = valid_files[0]
             except Exception:
+                # اگر ویدیو هیچ فایل یکپارچه‌ای نداشته باشد، yt-dlp اینجا خطا می‌دهد.
+                # ما خطا را نادیده می‌گیریم تا ربات سراغ ویدیوی بعدی برود (بدون کرش).
                 continue
 
+            # ارسال به تلگرام
             telegram_api_url = f"https://api.telegram.org/bot{telegram_token}/sendVideo"
             caption_text = f"🎥 **{video_title}**\n\n🔗 [مشاهده در یوتیوب]({video_url})\n\n#مهندسی_مکانیک #MechanicalEngineering"
 
@@ -170,27 +149,25 @@ def main(context):
                     if os.path.exists(f): os.remove(f)
                 continue
 
+            # پاکسازی سرور
             for f in valid_files:
-                if os.path.exists(f):
-                    os.remove(f)
+                if os.path.exists(f): os.remove(f)
 
             if tg_response.status_code == 200:
                 try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        databases.create_document(
-                            database_id=db_id,
-                            collection_id=collection_id,
-                            document_id='unique()',
-                            data={"videoId": video_id}
-                        )
+                    databases.create_document(
+                        database_id=db_id,
+                        collection_id=collection_id,
+                        document_id='unique()',
+                        data={"videoId": video_id}
+                    )
                     videos_posted_in_this_run += 1
                     context.log(f"✅ Successfully posted: {video_id}")
                 except Exception:
                     pass
 
     if videos_posted_in_this_run == 0:
-        context.log("ℹ️ Evaluated 50 short videos, but none met all criteria (or already posted).")
+        context.log("ℹ️ No suitable videos found in this run (or all were duplicates/lacked merged formats).")
 
     return context.res.json({
         "success": True,
