@@ -21,8 +21,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config از محیط ───────────────────────────────────────────
-TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID  = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHANNEL_ID  = os.environ.get("TELEGRAM_CHANNEL", "")
 YOUTUBE_SEARCH_QUERY = os.environ.get("YOUTUBE_SEARCH_QUERY", "python tutorial")
 YOUTUBE_COOKIES_B64  = os.environ.get("YOUTUBE_COOKIES", "")
 MAX_VIDEOS           = int(os.environ.get("MAX_VIDEOS", "3"))
@@ -73,11 +73,11 @@ def save_history(history: set):
 # ── جستجوی یوتیوب ────────────────────────────────────────────
 def search_youtube(query: str, cookie_path: str | None, max_results: int = 20) -> list[str]:
     ydl_opts = {
-        "quiet":           True,
-        "no_warnings":     True,
-        "extract_flat":    True,
-        "playlistend":     max_results,
-        "socket_timeout":  30,
+        "quiet":          True,
+        "no_warnings":    True,
+        "extract_flat":   True,
+        "playlistend":    max_results,
+        "socket_timeout": 30,
     }
     if cookie_path:
         ydl_opts["cookiefile"] = cookie_path
@@ -124,29 +124,22 @@ def get_video_info(video_id: str, cookie_path: str | None) -> dict | None:
 
 # ── دانلود ویدیو — بدون FFmpeg ───────────────────────────────
 def download_video(video_info: dict, tmpdir: str, cookie_path: str | None) -> str | None:
-    video_id  = video_info["id"]
+    video_id = video_info["id"]
     out_tmpl  = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
-    # فرمت‌های pre-merged که نیازی به FFmpeg ندارند
     FORMAT_STRATEGIES = [
-        # ۱. بهترین فایل یکپارچه mp4 زیر 50MB
         "best[ext=mp4][filesize<50M]",
-        # ۲. بهترین فایل یکپارچه زیر 50MB
         "best[filesize<50M]",
-        # ۳. بهترین فایل یکپارچه بدون محدودیت سایز
         "best",
-        # ۴. worst به عنوان آخرین گزینه
         "worst",
     ]
 
     base_opts = {
-        "outtmpl":        out_tmpl,
-        "quiet":          False,
-        "no_warnings":    False,
-        "socket_timeout": 60,
-        # غیرفعال کردن post-processing که نیاز به ffmpeg دارد
-        "postprocessors": [],
-        # جلوگیری از merge که نیاز به ffmpeg دارد
+        "outtmpl":          out_tmpl,
+        "quiet":            False,
+        "no_warnings":      False,
+        "socket_timeout":   60,
+        "postprocessors":   [],
         "nopostoverwrites": True,
     }
     if cookie_path:
@@ -160,7 +153,6 @@ def download_video(video_info: dict, tmpdir: str, cookie_path: str | None) -> st
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
-            # پیدا کردن فایل دانلود شده
             for f in Path(tmpdir).iterdir():
                 if f.name.startswith(video_id):
                     size_mb = f.stat().st_size / (1024 * 1024)
@@ -173,7 +165,6 @@ def download_video(video_info: dict, tmpdir: str, cookie_path: str | None) -> st
 
         except Exception as e:
             logger.warning(f"⚠️ Format '{fmt}' failed: {e}")
-            # پاک کردن فایل‌های ناقص
             for f in Path(tmpdir).iterdir():
                 f.unlink(missing_ok=True)
             continue
@@ -202,10 +193,10 @@ async def post_to_telegram(video_info: dict, video_path: str) -> bool:
                 lambda: requests.post(
                     url,
                     data={
-                        "chat_id":              TELEGRAM_CHANNEL_ID,
-                        "caption":              caption[:1024],
-                        "parse_mode":           "Markdown",
-                        "supports_streaming":   True,
+                        "chat_id":            TELEGRAM_CHANNEL_ID,
+                        "caption":            caption[:1024],
+                        "parse_mode":         "Markdown",
+                        "supports_streaming": True,
                     },
                     files={"video": vf},
                     timeout=120,
@@ -230,36 +221,68 @@ async def main(context):
     logger.info(f"📅 {datetime.now(timezone.utc).isoformat()}")
     logger.info("=" * 60)
 
-    # به‌روزرسانی yt-dlp (بدون ffmpeg)
     ensure_latest_ytdlp()
+
+    # بررسی متغیرهای محیطی
+    logger.info(f"🔑 TOKEN set: {bool(TELEGRAM_BOT_TOKEN)} | len={len(TELEGRAM_BOT_TOKEN)}")
+    logger.info(f"📢 CHANNEL set: {bool(TELEGRAM_CHANNEL_ID)} | value='{TELEGRAM_CHANNEL_ID}'")
+    logger.info(f"🔍 QUERY: '{YOUTUBE_SEARCH_QUERY}'")
+    logger.info(f"🍪 COOKIES set: {bool(YOUTUBE_COOKIES_B64)}")
+    logger.info(f"🎬 MAX_VIDEOS: {MAX_VIDEOS}")
 
     # اعتبارسنجی
     if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN is empty!")
         return context.res.json({"error": "Missing TELEGRAM_BOT_TOKEN"})
+
     if not TELEGRAM_CHANNEL_ID:
+        logger.error("❌ TELEGRAM_CHANNEL_ID is empty!")
         return context.res.json({"error": "Missing TELEGRAM_CHANNEL_ID"})
+
+    # تست اتصال تلگرام
+    logger.info("🔌 Testing Telegram connection...")
+    try:
+        test_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+        test_resp = requests.get(test_url, timeout=10)
+        if test_resp.status_code == 200:
+            bot_name = test_resp.json().get("result", {}).get("username", "unknown")
+            logger.info(f"✅ Telegram OK — Bot: @{bot_name}")
+        else:
+            logger.error(f"❌ Telegram auth failed: {test_resp.status_code} — {test_resp.text[:200]}")
+            return context.res.json({"error": "Telegram auth failed", "detail": test_resp.text[:200]})
+    except Exception as e:
+        logger.error(f"❌ Telegram connection error: {e}")
+        return context.res.json({"error": f"Telegram connection error: {e}"})
 
     # کوکی
     cookie_path = prepare_cookies()
+    logger.info(f"🍪 Cookie path: {cookie_path}")
 
     # تاریخچه
     posted_history = load_history()
     logger.info(f"📋 Already posted: {len(posted_history)} videos")
 
     # جستجو
-    logger.info(f"🔍 Searching: '{YOUTUBE_SEARCH_QUERY}'")
+    logger.info(f"🔍 Starting search for: '{YOUTUBE_SEARCH_QUERY}'")
     video_ids = search_youtube(YOUTUBE_SEARCH_QUERY, cookie_path, max_results=30)
+    logger.info(f"📦 Search result count: {len(video_ids)}")
 
     if not video_ids:
+        logger.error("❌ No videos found — search returned empty")
         return context.res.json({"error": "No videos found"})
 
     new_ids = [v for v in video_ids if v not in posted_history]
     logger.info(f"🆕 New videos: {len(new_ids)}/{len(video_ids)}")
 
+    if not new_ids:
+        logger.info("ℹ️ All videos already posted — nothing to do")
+        return context.res.json({"info": "All videos already posted"})
+
     stats = {"posted": 0, "no_info": 0, "dl_fail": 0, "tg_fail": 0}
 
     for video_id in new_ids:
         if stats["posted"] >= MAX_VIDEOS:
+            logger.info(f"✅ Reached target of {MAX_VIDEOS} posts")
             break
 
         logger.info(f"\n{'─' * 40}")
@@ -267,24 +290,36 @@ async def main(context):
 
         video_info = get_video_info(video_id, cookie_path)
         if not video_info:
+            logger.error(f"❌ No info for: {video_id}")
             stats["no_info"] += 1
             continue
 
+        logger.info(f"📝 Title: {video_info['title']}")
+        logger.info(f"⏱ Duration: {video_info['duration']}s")
+
         with tempfile.TemporaryDirectory() as tmpdir:
+            logger.info(f"📥 Downloading to: {tmpdir}")
             video_path = download_video(video_info, tmpdir, cookie_path)
 
             if not video_path:
+                logger.error(f"❌ Download failed: {video_id}")
                 stats["dl_fail"] += 1
                 continue
 
+            logger.info(f"📤 Sending to Telegram...")
             success = await post_to_telegram(video_info, video_path)
 
         if success:
             stats["posted"] += 1
             posted_history.add(video_id)
             save_history(posted_history)
+            logger.info(f"✅ Successfully posted: {video_info['title']}")
         else:
             stats["tg_fail"] += 1
+            logger.error(f"❌ Telegram post failed: {video_id}")
 
-    logger.info(f"\n📊 STATS: {stats}")
+    logger.info("\n" + "=" * 60)
+    logger.info(f"📊 FINAL STATS: {stats}")
+    logger.info("=" * 60)
+
     return context.res.json(stats)
